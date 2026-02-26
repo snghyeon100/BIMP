@@ -218,6 +218,8 @@ Youshu_DSS:
   test_interval: 5
 
   # WHATsNet bidirectional message passing
+  beta_bi: 0.1
+  K_bi_topk: 50
   num_bimp_layers: 1
   num_inducing_bimp: 4
   max_incident_K: 30

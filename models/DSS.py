@@ -377,7 +377,7 @@ class DSS(nn.Module):
         A'_BI  = A_BI + beta_bi * S_topk       [NB, NI]
         A'_BI^T stored as item_ptr_exp / item_adj_exp (CSR)
         """
-        beta_bi   = float(self.conf.get("beta_bi",    0.01))
+        beta_bi   = float(self.conf.get("beta_bi",    0.1))
         K_topk    = int  (self.conf.get("K_bi_topk",  50))
         NB, NI    = self.num_bundles, self.num_items
         NU        = self.num_users
