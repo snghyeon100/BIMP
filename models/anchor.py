@@ -79,7 +79,7 @@ class AnchorRadar(nn.Module):
         self.emb_size        = conf["embedding_size"]
         self.num_layers      = conf["num_layers"]
         self.anchor_lambda   = conf.get("anchor_lambda", 0.1)
-        self.anchor_temp     = conf.get("anchor_temp", 1.0)   # softmax temperature
+        self.anchor_temp     = conf.get("anchor_temp", 0.3)   # softmax temperature
         self.mlp_hidden      = conf.get("mlp_hidden_size", 64)
         self.c_temp          = conf.get("c_temp", 0.2)
 
@@ -103,8 +103,8 @@ class AnchorRadar(nn.Module):
         self.BI_graph = self._build_prop_graph(self.bi_graph)
 
         # Stage 1 MLP: local anchor score
-        # Input dim: 5 × emb_size (5 embedding vectors) + 5 (topology features)
-        mlp_in = self.emb_size * 5 + 5
+        # Input: 4 cosine similarities + 5 topology features = 9 scalars
+        mlp_in = 4 + 5   # cos(euUB,eiUI), cos(euUI,eiUI), cos(ebUB,eiUI), cos(ebBI,eiBI) + topo
         self.stage1_mlp = nn.Sequential(
             nn.Linear(mlp_in, self.mlp_hidden),
             nn.ReLU(),
@@ -377,17 +377,29 @@ class AnchorRadar(nn.Module):
         e_i_UI_3d  = e_i_UI[safe_items]
         e_i_BI_3d  = e_i_BI[safe_items]
 
-        # ---- Stage 1: local score ----
-        # MLP input: concat of 5 emb vectors + 5 topo features
-        # [bs_total, max_T, 5*D + 5]
+        # ---- Stage 1: local score — cosine similarity based MLP input ----
+        # L2-normalise all embedding vectors before cross-view dot products
+        eu_UB_n = F.normalize(e_u_UB_3d,  p=2, dim=-1)  # [bs_total, max_T, D]
+        eu_UI_n = F.normalize(e_u_UI_3d,  p=2, dim=-1)
+        ei_UI_n = F.normalize(e_i_UI_3d,  p=2, dim=-1)
+        eb_UB_n = F.normalize(e_b_UB_3d,  p=2, dim=-1)
+        eb_BI_n = F.normalize(e_b_BI_3d,  p=2, dim=-1)
+        ei_BI_n = F.normalize(e_i_BI_3d,  p=2, dim=-1)
+
+        # 4 cosine similarities → each [bs_total, max_T, 1]
+        cos_eu_UB_ei_UI = (eu_UB_n * ei_UI_n).sum(-1, keepdim=True)  # cross-view
+        cos_eu_UI_ei_UI = (eu_UI_n * ei_UI_n).sum(-1, keepdim=True)  # same-view
+        cos_eb_UB_ei_UI = (eb_UB_n * ei_UI_n).sum(-1, keepdim=True)  # cross-view
+        cos_eb_BI_ei_BI = (eb_BI_n * ei_BI_n).sum(-1, keepdim=True)  # same-view
+
+        # MLP input: [bs_total, max_T, 9]
         mlp_input = torch.cat([
-            e_u_UB_3d,   # D
-            e_u_UI_3d,   # D
-            e_i_UI_3d,   # D
-            e_b_UB_3d,   # D
-            e_b_BI_3d,   # D
-            topo,        # 5
-        ], dim=-1)       # [bs_total, max_T, 5D+5]
+            cos_eu_UB_ei_UI,   # 1
+            cos_eu_UI_ei_UI,   # 1
+            cos_eb_UB_ei_UI,   # 1
+            cos_eb_BI_ei_BI,   # 1
+            topo,              # 5
+        ], dim=-1)             # [bs_total, max_T, 9]
 
         s1 = self.stage1_mlp(mlp_input).squeeze(-1)        # [bs_total, max_T]
 
@@ -556,10 +568,21 @@ class AnchorRadar(nn.Module):
             eb_UB_4d = eb_UB_u.unsqueeze(2).expand(nu, N, max_T, -1)
             eb_BI_4d = eb_BI_u.unsqueeze(2).expand(nu, N, max_T, -1)
 
-            # Stage 1 MLP — peak: [nu×N, max_T, 5D+5]
-            mlp_in = torch.cat(
-                [eu_UB_4d, eu_UI_4d, ei_UI_4d, eb_UB_4d, eb_BI_4d, topo_u], dim=-1
-            )
+            # Stage 1 MLP — cosine similarity based, peak: [nu×N, max_T, 9]
+            eu_UB_n = F.normalize(eu_UB_4d, p=2, dim=-1)
+            eu_UI_n = F.normalize(eu_UI_4d, p=2, dim=-1)
+            ei_UI_n = F.normalize(ei_UI_4d, p=2, dim=-1)
+            eb_UB_n = F.normalize(eb_UB_4d, p=2, dim=-1)
+            eb_BI_n = F.normalize(eb_BI_4d, p=2, dim=-1)
+            ei_BI_n = F.normalize(ei_BI_4d, p=2, dim=-1)
+
+            mlp_in = torch.cat([
+                (eu_UB_n * ei_UI_n).sum(-1, keepdim=True),  # cos(euUB, eiUI)
+                (eu_UI_n * ei_UI_n).sum(-1, keepdim=True),  # cos(euUI, eiUI)
+                (eb_UB_n * ei_UI_n).sum(-1, keepdim=True),  # cos(ebUB, eiUI)
+                (eb_BI_n * ei_BI_n).sum(-1, keepdim=True),  # cos(ebBI, eiBI)
+                topo_u,                                      # 5 topo features
+            ], dim=-1)                                       # [nu, N, max_T, 9]
             s1 = self.stage1_mlp(
                 mlp_in.view(nu * N, max_T, -1)
             ).squeeze(-1).view(nu, N, max_T)
