@@ -9,22 +9,23 @@ NetEase:
   num_layerss: [2]
 
   # AnchorRadar-specific
-  anchor_lambdas: [0.1]   # λ: weight for Stage2 global score (s1 + λ·s2)
-  mlp_hidden_size: 64     # Stage1 MLP hidden dimension
+  anchor_lambdas: [0.1]   # λ: Stage2 global score weight
+  anchor_temps: [1.0]     # T: softmax temperature (< 1 = sharper, > 1 = softer)
+  mlp_hidden_size: 64
 
   lrs: [1.0e-3]
   l2_regs: [1.0e-5]
 
-  # Contrastive loss (set c_lambda: 0 for BPR-only, computation skipped entirely)
+  # Contrastive loss (c_lambda=0 → BPR-only, computation fully skipped)
   c_lambdas: [0.05]
   c_temps: [0.2]
 
   epochs: 50
   test_interval: 5
 
-  # Eval memory control: peak tensor = [eval_user_chunk, eval_bundle_chunk, max_T, 5D+5]
-  eval_bundle_chunk: 512  # reduce if OOM (bundle dimension)
-  eval_user_chunk: 64     # reduce if OOM (user dimension)
+  # Eval memory: peak = [eval_user_chunk × rerank_k × max_T × (5D+5)]
+  rerank_k: 500
+  eval_user_chunk: 64
 
 
 iFashion:
@@ -38,6 +39,7 @@ iFashion:
   num_layerss: [2]
 
   anchor_lambdas: [0.1]
+  anchor_temps: [1.0]
   mlp_hidden_size: 64
 
   lrs: [1.0e-3]
@@ -49,7 +51,7 @@ iFashion:
   epochs: 50
   test_interval: 5
 
-  eval_bundle_chunk: 512
+  rerank_k: 500
   eval_user_chunk: 64
 
 
@@ -64,6 +66,7 @@ Youshu:
   num_layerss: [2]
 
   anchor_lambdas: [0.1]
+  anchor_temps: [1.0]
   mlp_hidden_size: 64
 
   lrs: [1.0e-3]
@@ -75,5 +78,5 @@ Youshu:
   epochs: 100
   test_interval: 5
 
-  eval_bundle_chunk: 512
+  rerank_k: 500
   eval_user_chunk: 64

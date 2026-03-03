@@ -8,8 +8,8 @@ Architecture
   - Anchor Attention:
       Stage 1 (Local Score)  : MLP(e_u, e_i, e_b, topo_features) -> scalar
       Stage 2 (Global Strength): Linear(e_i^BI) -> scalar
-      Final weight α = softmax(s1 + λ·s2)  [masked over bundle items]
-  - Score(u, B) = <e_u^UB, e_b^UB> + Σ_i α_{u,i,B} · <e_u^UI, e_i^UI>
+      Final weight alpha = softmax((s1 + lambda*s2) / T)  [masked over bundle items]
+  - Score(u, B) = <e_u^UB, e_b^UB> + sum_i alpha_{u,i,B} * <e_u^UI, e_i^UI>
   - Loss: BPR + c_lambda * InfoNCE (contrastive)
 """
 
@@ -79,6 +79,7 @@ class AnchorRadar(nn.Module):
         self.emb_size        = conf["embedding_size"]
         self.num_layers      = conf["num_layers"]
         self.anchor_lambda   = conf.get("anchor_lambda", 0.1)
+        self.anchor_temp     = conf.get("anchor_temp", 1.0)   # softmax temperature
         self.mlp_hidden      = conf.get("mlp_hidden_size", 64)
         self.c_temp          = conf.get("c_temp", 0.2)
 
@@ -394,7 +395,7 @@ class AnchorRadar(nn.Module):
         s2 = self.stage2_linear(e_i_BI_3d).squeeze(-1)     # [bs_total, max_T]
 
         # ---- Combined score + mask ----
-        combined = s1 + self.anchor_lambda * s2             # [bs_total, max_T]
+        combined = (s1 + self.anchor_lambda * s2) / self.anchor_temp  # [bs_total, max_T]
 
         # Mask padding positions with -inf before softmax
         INF = 1e9
@@ -474,12 +475,11 @@ class AnchorRadar(nn.Module):
 
     def evaluate(self, eval_cache, users):
         """
-        Personalised U×B score matrix — Stage 1+2 attention.
-        Memory-safe via USER chunk × BUNDLE chunk double loop.
+        Coarse-to-Fine 2-step evaluation.
 
-        Peak tensor size: [uc, bc, max_T, 5D+5]  (fully materialised by cat)
-        e.g. uc=16, bc=512, max_T=5, D=64 → 16×512×5×325×4B ≈ 53 MB  (fine)
-        vs old single-user-loop: [2048, 512, 5, 325×4B ≈ 6.8 GB  (OOM)
+        Step 1 (Coarse)  O(N_u × N_b)  — score_base dot-product, pick top-N per user.
+        Step 2 (Fine)    O(N_u × N)    — Stage 1+2 AnchorRadar only on N candidates.
+        Final: scatter item scores back to full [bs_eval, N_b] matrix.
         """
         embs, precomp = eval_cache
         e_u_UB, e_b_UB, e_u_UI, e_i_UI, e_b_BI, e_i_BI = embs
@@ -489,72 +489,93 @@ class AnchorRadar(nn.Module):
         e_b_UB_bun = precomp["e_b_UB_bun"]   # [N_b, D]
         e_b_BI_bun = precomp["e_b_BI_bun"]
         topo_bun   = precomp["topo_bun"]      # [N_b, max_T, 5]
-        s2         = precomp["s2"]            # [N_b, max_T]
-        mask       = self.bundle_mask_topo    # [N_b, max_T]
+        s2_all     = precomp["s2"]            # [N_b, max_T]
+        mask_all   = self.bundle_mask_topo    # [N_b, max_T]
 
-        N_b    = self.num_bundles
-        max_T  = self.bundle_items_topo.shape[1]
-        bs_eval= users.shape[0]
-        bc     = self.conf.get("eval_bundle_chunk", 512)  # bundle chunk
-        uc     = self.conf.get("eval_user_chunk",   64)   # user chunk
-        INF    = 1e9
+        N_b     = self.num_bundles
+        max_T   = self.bundle_items_topo.shape[1]
+        bs_eval = users.shape[0]
+        N       = min(self.conf.get("rerank_k", 500), N_b)
+        uc      = self.conf.get("eval_user_chunk", 64)
+        INF     = 1e9
 
-        # Base score: pure dot-product → one mm, no OOM
-        score_base = e_u_UB[users] @ e_b_UB.T              # [bs_eval, N_b]
-        score_item = torch.zeros(bs_eval, N_b, device=self.device)
+        # ------------------------------------------------------------------
+        # Step 1: Coarse — Score_fast = <e_u^UB, e_b^UB> + max_i(<e_u^UI, e_i^UI>)
+        # chunked over users to avoid [bs_eval, N_b*max_T] OOM
+        # ------------------------------------------------------------------
+        eu_UB_all = e_u_UB[users]    # [bs_eval, D]
+        eu_UI_all = e_u_UI[users]    # [bs_eval, D]
+        D         = eu_UI_all.shape[-1]
 
-        for b_start in range(0, N_b, bc):
-            b_end    = min(b_start + bc, N_b)
-            nb       = b_end - b_start
+        ei_UI_flat = e_i_UI_bun.view(-1, D)          # [N_b*max_T, D]  — shared, no copy
+        score_fast = torch.zeros(bs_eval, N_b, device=self.device)
 
-            # Slices — bundle side (no user dim yet)
-            ei_UI_c = e_i_UI_bun[b_start:b_end]   # [nb, max_T, D]
-            ei_BI_c = e_i_BI_bun[b_start:b_end]
-            eb_UB_c = e_b_UB_bun[b_start:b_end]   # [nb, D]
-            eb_BI_c = e_b_BI_bun[b_start:b_end]
-            topo_c  = topo_bun[b_start:b_end]      # [nb, max_T, 5]
-            s2_c    = s2[b_start:b_end]             # [nb, max_T]
-            mask_c  = mask[b_start:b_end]           # [nb, max_T]
+        for u_start in range(0, bs_eval, uc):
+            u_end   = min(u_start + uc, bs_eval)
+            eu_UB_u = eu_UB_all[u_start:u_end]       # [nu, D]
+            eu_UI_u = eu_UI_all[u_start:u_end]
 
-            for u_start in range(0, bs_eval, uc):
-                u_end = min(u_start + uc, bs_eval)
-                nu    = u_end - u_start
+            score_ub_u  = eu_UB_u @ e_b_UB.T         # [nu, N_b]
 
-                # User embs for this sub-batch: [nu, D]
-                eu_UB_u = e_u_UB[users[u_start:u_end]]   # [nu, D]
-                eu_UI_u = e_u_UI[users[u_start:u_end]]
+            ui_u = (eu_UI_u @ ei_UI_flat.T            # [nu, N_b*max_T]
+                    ).view(-1, N_b, max_T)
+            ui_u = ui_u.masked_fill(
+                ~mask_all.unsqueeze(0), -INF
+            )
+            max_ui_u = ui_u.max(dim=-1).values        # [nu, N_b]
 
-                # Expand to [nu, nb, max_T, D]  — materialised by cat below
-                eu_UB_4d = eu_UB_u.unsqueeze(1).unsqueeze(2).expand(nu, nb, max_T, -1)
-                eu_UI_4d = eu_UI_u.unsqueeze(1).unsqueeze(2).expand(nu, nb, max_T, -1)
+            score_fast[u_start:u_end] = score_ub_u + max_ui_u
 
-                ei_UI_4d = ei_UI_c.unsqueeze(0).expand(nu, -1, -1, -1)
-                ei_BI_4d = ei_BI_c.unsqueeze(0).expand(nu, -1, -1, -1)
-                eb_UB_4d = eb_UB_c.unsqueeze(0).unsqueeze(2).expand(nu, -1, max_T, -1)
-                eb_BI_4d = eb_BI_c.unsqueeze(0).unsqueeze(2).expand(nu, -1, max_T, -1)
-                topo_4d  = topo_c.unsqueeze(0).expand(nu, -1, -1, -1)
+        _, topk_idx = torch.topk(score_fast, k=N, dim=1)  # [bs_eval, N]
 
-                # Stage 1 MLP — peak tensor: [nu×bc, max_T, 5D+5]
-                mlp_in = torch.cat(
-                    [eu_UB_4d, eu_UI_4d, ei_UI_4d, eb_UB_4d, eb_BI_4d, topo_4d],
-                    dim=-1
-                )                                          # [nu, nb, max_T, 5D+5]
-                s1 = self.stage1_mlp(
-                    mlp_in.view(nu * nb, max_T, -1)
-                ).squeeze(-1).view(nu, nb, max_T)         # [nu, nb, max_T]
+        # ------------------------------------------------------------------
+        # Step 2: Fine — gather & MLP INSIDE user-chunk loop
+        #   gather [uc, N, ...] instead of [bs_eval, N, ...] → avoids OOM
+        # ------------------------------------------------------------------
+        score_item_topk = torch.zeros(bs_eval, N, device=self.device)
 
-                # Combine Stage 1 + broadcast Stage 2
-                combined = s1 + self.anchor_lambda * s2_c.unsqueeze(0)
-                mask_exp = mask_c.unsqueeze(0).expand(nu, -1, -1)
-                combined = combined.masked_fill(~mask_exp, -INF)
-                alpha    = F.softmax(combined, dim=-1) * mask_exp.float()
+        for u_start in range(0, bs_eval, uc):
+            u_end    = min(u_start + uc, bs_eval)
+            nu       = u_end - u_start
+            topk_u   = topk_idx[u_start:u_end]       # [nu, N]
 
-                # Σ_i α · <e_u^UI, e_i^UI>
-                ui_dot = (eu_UI_4d * ei_UI_4d).sum(dim=-1)  # [nu, nb, max_T]
-                score_item[u_start:u_end, b_start:b_end] = \
-                    (alpha * ui_dot).sum(dim=-1)             # [nu, nb]
+            # Gather bundle tensors for THIS user slice only — [nu, N, ...]
+            ei_UI_4d = e_i_UI_bun[topk_u]            # [nu, N, max_T, D]
+            ei_BI_4d = e_i_BI_bun[topk_u]
+            eb_UB_u  = e_b_UB_bun[topk_u]            # [nu, N, D]
+            eb_BI_u  = e_b_BI_bun[topk_u]
+            topo_u   = topo_bun[topk_u]              # [nu, N, max_T, 5]
+            s2_u     = s2_all[topk_u]               # [nu, N, max_T]
+            mask_u   = mask_all[topk_u]             # [nu, N, max_T]
 
-        return score_base + score_item
+            # Expand user embs: [nu, D] → [nu, N, max_T, D]
+            eu_UB_4d = eu_UB_all[u_start:u_end].unsqueeze(1).unsqueeze(2).expand(nu, N, max_T, -1)
+            eu_UI_4d = eu_UI_all[u_start:u_end].unsqueeze(1).unsqueeze(2).expand(nu, N, max_T, -1)
+
+            # Expand bundle embs: [nu, N, D] → [nu, N, max_T, D]
+            eb_UB_4d = eb_UB_u.unsqueeze(2).expand(nu, N, max_T, -1)
+            eb_BI_4d = eb_BI_u.unsqueeze(2).expand(nu, N, max_T, -1)
+
+            # Stage 1 MLP — peak: [nu×N, max_T, 5D+5]
+            mlp_in = torch.cat(
+                [eu_UB_4d, eu_UI_4d, ei_UI_4d, eb_UB_4d, eb_BI_4d, topo_u], dim=-1
+            )
+            s1 = self.stage1_mlp(
+                mlp_in.view(nu * N, max_T, -1)
+            ).squeeze(-1).view(nu, N, max_T)
+
+            combined = (s1 + self.anchor_lambda * s2_u) / self.anchor_temp
+            combined = combined.masked_fill(~mask_u, -INF)
+            alpha    = F.softmax(combined, dim=-1) * mask_u.float()
+
+            ui_dot = (eu_UI_4d * ei_UI_4d).sum(dim=-1)   # [nu, N, max_T]
+            score_item_topk[u_start:u_end] = (alpha * ui_dot).sum(dim=-1)
+
+        # Scatter item correction into full [bs_eval, N_b] matrix
+        score_item_full = torch.zeros(bs_eval, N_b, device=self.device)
+        score_item_full.scatter_(1, topk_idx, score_item_topk)
+
+        return score_fast + score_item_full
 
     def get_all_embeddings_for_eval(self):
         """

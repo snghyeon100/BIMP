@@ -401,14 +401,19 @@ class AnchorDatasets(Datasets):
                 bundle_items_t[b, :n] = torch.tensor(items, dtype=torch.long)
                 bundle_mask_t[b,  :n] = True
 
-        # ---- 3. Derived features ----
-        item_pop_t        = torch.tensor(item_pop,           dtype=torch.float32)  # [N_items]
-        item_spec_t       = 1.0 / (item_pop_t + eps)                               # [N_items]
+        # ---- 3. Derived features — log1p 정규화로 MLP 입력 스케일 통일 ----
+        # item_pop, bundle_size는 지수 분포 → log1p로 완만하게 압축 후 max 정규화
+        item_pop_t     = torch.tensor(item_pop, dtype=torch.float32)   # [N_items]
 
-        # Normalise popularity and bundle size to [0,1] for MLP stability
-        item_pop_norm     = item_pop_t  / (item_pop_t.max()  + eps)                # [N_items]
-        bsize_norm        = bsize_t     / (bsize_t.max()     + eps)                # [N_bundles]
-        item_spec_norm    = item_spec_t / (item_spec_t.max() + eps)                # [N_items]
+        item_pop_log   = torch.log1p(item_pop_t)                       # log(1+pop)
+        bsize_log      = torch.log1p(bsize_t)                          # log(1+size)
+
+        item_pop_norm  = item_pop_log  / (item_pop_log.max()  + eps)   # [0, 1]
+        bsize_norm     = bsize_log     / (bsize_log.max()     + eps)   # [0, 1]
+
+        # specificity: 인기 없는 아이템일수록 높음 → 1 / log1p(pop+1)
+        item_spec_t    = 1.0 / (item_pop_log + eps)                    # unbounded
+        item_spec_norm = item_spec_t / (item_spec_t.max() + eps)       # [0, 1]
 
         self.anchor_info = {
             # core tensors

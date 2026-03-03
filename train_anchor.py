@@ -72,7 +72,7 @@ def main():
     conf["device"] = device
     print(conf)
 
-    for lr, l2_reg, embedding_size, num_layers, c_lambda, c_temp, anchor_lambda in \
+    for lr, l2_reg, embedding_size, num_layers, c_lambda, c_temp, anchor_lambda, anchor_temp in \
             product(
                 conf["lrs"],
                 conf["l2_regs"],
@@ -81,6 +81,7 @@ def main():
                 conf["c_lambdas"],
                 conf["c_temps"],
                 conf["anchor_lambdas"],
+                conf.get("anchor_temps", [1.0]),
             ):
 
         # ---- Paths ----
@@ -98,6 +99,7 @@ def main():
         conf["c_lambda"]      = c_lambda
         conf["c_temp"]        = c_temp
         conf["anchor_lambda"] = anchor_lambda
+        conf["anchor_temp"]   = anchor_temp
 
         # ---- Run ID string ----
         settings = []
