@@ -457,11 +457,14 @@ class AnchorRadar(nn.Module):
         # BPR Loss
         bpr_loss = cal_bpr_loss(scores)
 
-        # Contrastive Loss (user & bundle views)
-        # Use UB and UI user representations as two views
-        u_cl = self._cal_c_loss(e_u_UB[users], e_u_UI[users])
-        b_cl = self._cal_c_loss(e_b_UB[bundles[:, 0]], e_b_BI[bundles[:, 0]])
-        c_loss = (u_cl + b_cl) / 2.0
+        # Contrastive Loss — skip entirely when c_lambda == 0
+        c_lambda = self.conf.get("c_lambda", 0.0)
+        if c_lambda > 0:
+            u_cl = self._cal_c_loss(e_u_UB[users], e_u_UI[users])
+            b_cl = self._cal_c_loss(e_b_UB[bundles[:, 0]], e_b_BI[bundles[:, 0]])
+            c_loss = (u_cl + b_cl) / 2.0
+        else:
+            c_loss = torch.tensor(0.0, device=self.device)
 
         return bpr_loss, c_loss
 
@@ -471,75 +474,85 @@ class AnchorRadar(nn.Module):
 
     def evaluate(self, eval_cache, users):
         """
-        Full personalised U×B score matrix using Stage 1+2 attention.
+        Personalised U×B score matrix — Stage 1+2 attention.
+        Memory-safe via USER chunk × BUNDLE chunk double loop.
 
-        eval_cache: output of get_all_embeddings_for_eval()
-        users      : [bs_eval] user indices (on device)
-
-        Returns scores: [bs_eval, N_bundles]
+        Peak tensor size: [uc, bc, max_T, 5D+5]  (fully materialised by cat)
+        e.g. uc=16, bc=512, max_T=5, D=64 → 16×512×5×325×4B ≈ 53 MB  (fine)
+        vs old single-user-loop: [2048, 512, 5, 325×4B ≈ 6.8 GB  (OOM)
         """
         embs, precomp = eval_cache
         e_u_UB, e_b_UB, e_u_UI, e_i_UI, e_b_BI, e_i_BI = embs
-        # precomp: dict with pre-sliced bundle-level tensors
+
         e_i_UI_bun = precomp["e_i_UI_bun"]   # [N_b, max_T, D]
-        e_i_BI_bun = precomp["e_i_BI_bun"]   # [N_b, max_T, D]
+        e_i_BI_bun = precomp["e_i_BI_bun"]
         e_b_UB_bun = precomp["e_b_UB_bun"]   # [N_b, D]
-        e_b_BI_bun = precomp["e_b_BI_bun"]   # [N_b, D]
-        topo_bun   = precomp["topo_bun"]      # [N_b, max_T, 5]   affinity/overlap = 0
+        e_b_BI_bun = precomp["e_b_BI_bun"]
+        topo_bun   = precomp["topo_bun"]      # [N_b, max_T, 5]
         s2         = precomp["s2"]            # [N_b, max_T]
         mask       = self.bundle_mask_topo    # [N_b, max_T]
 
-        N_b     = self.num_bundles
-        max_T   = self.bundle_items_topo.shape[1]
-        D       = self.emb_size
-        bs_eval = users.shape[0]
-        chunk   = self.conf.get("eval_bundle_chunk", 512)
-        INF     = 1e9
+        N_b    = self.num_bundles
+        max_T  = self.bundle_items_topo.shape[1]
+        bs_eval= users.shape[0]
+        bc     = self.conf.get("eval_bundle_chunk", 512)  # bundle chunk
+        uc     = self.conf.get("eval_user_chunk",   64)   # user chunk
+        INF    = 1e9
 
-        score_base = e_u_UB[users] @ e_b_UB.T  # [bs_eval, N_b]
+        # Base score: pure dot-product → one mm, no OOM
+        score_base = e_u_UB[users] @ e_b_UB.T              # [bs_eval, N_b]
         score_item = torch.zeros(bs_eval, N_b, device=self.device)
 
-        for b_start in range(0, N_b, chunk):
-            b_end = min(b_start + chunk, N_b)
-            nb    = b_end - b_start
+        for b_start in range(0, N_b, bc):
+            b_end    = min(b_start + bc, N_b)
+            nb       = b_end - b_start
 
-            # Bundle-side tensors for this chunk  [nb, max_T, D]
-            e_i_UI_c = e_i_UI_bun[b_start:b_end]   # [nb, max_T, D]
-            e_i_BI_c = e_i_BI_bun[b_start:b_end]
-            e_b_UB_c = e_b_UB_bun[b_start:b_end]   # [nb, D]
-            e_b_BI_c = e_b_BI_bun[b_start:b_end]
-            topo_c   = topo_bun[b_start:b_end]      # [nb, max_T, 5]
-            s2_c     = s2[b_start:b_end]             # [nb, max_T]
-            mask_c   = mask[b_start:b_end]           # [nb, max_T]
+            # Slices — bundle side (no user dim yet)
+            ei_UI_c = e_i_UI_bun[b_start:b_end]   # [nb, max_T, D]
+            ei_BI_c = e_i_BI_bun[b_start:b_end]
+            eb_UB_c = e_b_UB_bun[b_start:b_end]   # [nb, D]
+            eb_BI_c = e_b_BI_bun[b_start:b_end]
+            topo_c  = topo_bun[b_start:b_end]      # [nb, max_T, 5]
+            s2_c    = s2[b_start:b_end]             # [nb, max_T]
+            mask_c  = mask[b_start:b_end]           # [nb, max_T]
 
-            # Expand user embs: [bs_eval, D] -> [bs_eval, nb, max_T, D]
-            eu_UB = e_u_UB[users].unsqueeze(1).unsqueeze(2).expand(-1, nb, max_T, -1)
-            eu_UI = e_u_UI[users].unsqueeze(1).unsqueeze(2).expand(-1, nb, max_T, -1)
+            for u_start in range(0, bs_eval, uc):
+                u_end = min(u_start + uc, bs_eval)
+                nu    = u_end - u_start
 
-            # Expand bundle tensors: [nb, max_T, D] -> [bs_eval, nb, max_T, D]
-            ei_UI = e_i_UI_c.unsqueeze(0).expand(bs_eval, -1, -1, -1)
-            ei_BI = e_i_BI_c.unsqueeze(0).expand(bs_eval, -1, -1, -1)
-            eb_UB = e_b_UB_c.unsqueeze(0).unsqueeze(2).expand(bs_eval, -1, max_T, -1)
-            eb_BI = e_b_BI_c.unsqueeze(0).unsqueeze(2).expand(bs_eval, -1, max_T, -1)
-            topo  = topo_c.unsqueeze(0).expand(bs_eval, -1, -1, -1)   # [bs, nb, max_T, 5]
+                # User embs for this sub-batch: [nu, D]
+                eu_UB_u = e_u_UB[users[u_start:u_end]]   # [nu, D]
+                eu_UI_u = e_u_UI[users[u_start:u_end]]
 
-            # Stage 1 MLP  — reshape to [bs_eval*nb, max_T, 5D+5]
-            mlp_in = torch.cat([eu_UB, eu_UI, ei_UI, eb_UB, eb_BI, topo], dim=-1)
-            bs_nb  = bs_eval * nb
-            s1_c   = self.stage1_mlp(mlp_in.view(bs_nb, max_T, -1)).squeeze(-1)  # [bs*nb, max_T]
-            s1_c   = s1_c.view(bs_eval, nb, max_T)
+                # Expand to [nu, nb, max_T, D]  — materialised by cat below
+                eu_UB_4d = eu_UB_u.unsqueeze(1).unsqueeze(2).expand(nu, nb, max_T, -1)
+                eu_UI_4d = eu_UI_u.unsqueeze(1).unsqueeze(2).expand(nu, nb, max_T, -1)
 
-            # Stage 2 is bundle-only, broadcast over users
-            s2_exp = s2_c.unsqueeze(0).expand(bs_eval, -1, -1)          # [bs, nb, max_T]
-            combined = s1_c + self.anchor_lambda * s2_exp                 # [bs, nb, max_T]
+                ei_UI_4d = ei_UI_c.unsqueeze(0).expand(nu, -1, -1, -1)
+                ei_BI_4d = ei_BI_c.unsqueeze(0).expand(nu, -1, -1, -1)
+                eb_UB_4d = eb_UB_c.unsqueeze(0).unsqueeze(2).expand(nu, -1, max_T, -1)
+                eb_BI_4d = eb_BI_c.unsqueeze(0).unsqueeze(2).expand(nu, -1, max_T, -1)
+                topo_4d  = topo_c.unsqueeze(0).expand(nu, -1, -1, -1)
 
-            mask_exp = mask_c.unsqueeze(0).expand(bs_eval, -1, -1)       # [bs, nb, max_T]
-            combined = combined.masked_fill(~mask_exp, -INF)
-            alpha    = F.softmax(combined, dim=-1) * mask_exp.float()     # [bs, nb, max_T]
+                # Stage 1 MLP — peak tensor: [nu×bc, max_T, 5D+5]
+                mlp_in = torch.cat(
+                    [eu_UB_4d, eu_UI_4d, ei_UI_4d, eb_UB_4d, eb_BI_4d, topo_4d],
+                    dim=-1
+                )                                          # [nu, nb, max_T, 5D+5]
+                s1 = self.stage1_mlp(
+                    mlp_in.view(nu * nb, max_T, -1)
+                ).squeeze(-1).view(nu, nb, max_T)         # [nu, nb, max_T]
 
-            # Item score: Σ_i α · <e_u^UI, e_i^UI>
-            ui_dot   = (eu_UI * ei_UI).sum(dim=-1)                        # [bs, nb, max_T]
-            score_item[:, b_start:b_end] = (alpha * ui_dot).sum(dim=-1)  # [bs, nb]
+                # Combine Stage 1 + broadcast Stage 2
+                combined = s1 + self.anchor_lambda * s2_c.unsqueeze(0)
+                mask_exp = mask_c.unsqueeze(0).expand(nu, -1, -1)
+                combined = combined.masked_fill(~mask_exp, -INF)
+                alpha    = F.softmax(combined, dim=-1) * mask_exp.float()
+
+                # Σ_i α · <e_u^UI, e_i^UI>
+                ui_dot = (eu_UI_4d * ei_UI_4d).sum(dim=-1)  # [nu, nb, max_T]
+                score_item[u_start:u_end, b_start:b_end] = \
+                    (alpha * ui_dot).sum(dim=-1)             # [nu, nb]
 
         return score_base + score_item
 

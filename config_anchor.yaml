@@ -15,13 +15,16 @@ NetEase:
   lrs: [1.0e-3]
   l2_regs: [1.0e-5]
 
-  # Contrastive loss (set c_lambda: 0 for BPR-only)
+  # Contrastive loss (set c_lambda: 0 for BPR-only, computation skipped entirely)
   c_lambdas: [0.05]
   c_temps: [0.2]
 
   epochs: 50
   test_interval: 5
-  eval_bundle_chunk: 512  # bundle chunk size in evaluate() — reduce if OOM
+
+  # Eval memory control: peak tensor = [eval_user_chunk, eval_bundle_chunk, max_T, 5D+5]
+  eval_bundle_chunk: 512  # reduce if OOM (bundle dimension)
+  eval_user_chunk: 64     # reduce if OOM (user dimension)
 
 
 iFashion:
@@ -45,7 +48,9 @@ iFashion:
 
   epochs: 50
   test_interval: 5
+
   eval_bundle_chunk: 512
+  eval_user_chunk: 64
 
 
 Youshu:
@@ -69,4 +74,6 @@ Youshu:
 
   epochs: 100
   test_interval: 5
+
   eval_bundle_chunk: 512
+  eval_user_chunk: 64
