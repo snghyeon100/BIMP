@@ -128,7 +128,8 @@ def main():
         # ---- Model ----
         model = AnchorRadar(conf, dataset.graphs, dataset.anchor_info).to(device)
 
-        optimizer  = optim.Adam(model.parameters(), lr=lr, weight_decay=conf["l2_reg"])
+        # Disable Adam's dense weight_decay because we'll add BPR reg_loss manually
+        optimizer  = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
 
         batch_cnt        = len(dataset.train_loader)
         test_interval_bs = int(batch_cnt * conf["test_interval"])
@@ -151,8 +152,12 @@ def main():
                 optimizer.zero_grad()
                 batch = [x.to(device) for x in batch]
 
-                bpr_loss, c_loss = model(batch)
-                loss = bpr_loss + conf["c_lambda"] * c_loss
+                bpr_loss, c_loss, mean_ent, mean_base, mean_item, reg_loss = model(batch)
+                
+                ent_lambda = conf.get("ent_lambda", 0.1)
+                reg_weight = conf.get("l2_reg", 1e-5)
+                loss = bpr_loss + conf["c_lambda"] * c_loss + ent_lambda * mean_ent + reg_weight * reg_loss
+                
                 loss.backward()
                 optimizer.step()
 
@@ -160,14 +165,22 @@ def main():
                 loss_s         = loss.detach().item()
                 bpr_s          = bpr_loss.detach().item()
                 c_s            = c_loss.detach().item()
+                ent_s          = mean_ent.detach().item()
+                base_s         = mean_base.detach().item()
+                item_s         = mean_item.detach().item()
+                reg_s          = (reg_weight * reg_loss).detach().item()
 
                 run.add_scalar("loss_bpr", bpr_s, batch_anchor)
                 run.add_scalar("loss_c",   c_s,   batch_anchor)
-                run.add_scalar("loss",     loss_s, batch_anchor)
+                run.add_scalar("loss_ent", ent_s, batch_anchor)
+                run.add_scalar("loss_reg", reg_s, batch_anchor)
+                run.add_scalar("loss_ttl", loss_s, batch_anchor)
+                run.add_scalar("score_base_abs_mean", base_s, batch_anchor)
+                run.add_scalar("score_item_abs_mean", item_s, batch_anchor)
 
                 pbar.set_description(
-                    "epoch: %d | loss: %.4f  bpr: %.4f  cl: %.4f"
-                    % (epoch, loss_s, bpr_s, c_s)
+                    "ep:%d | loss:%.4f (bpr:%.4f ent:%.4f reg:%.2e) | base:%.4f item:%.4f"
+                    % (epoch, loss_s, bpr_s, ent_s, reg_s, base_s, item_s)
                 )
 
                 if (batch_anchor + 1) % test_interval_bs == 0:

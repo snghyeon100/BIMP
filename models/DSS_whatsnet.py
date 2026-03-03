@@ -999,7 +999,22 @@ class DSS(nn.Module):
         else:
             c_loss = torch.tensor(0.0, device=self.device)
 
-        return bpr_loss, c_loss
+        # BPR Regularization Loss
+        bs = users.shape[0]
+        bundles_flat = bundles.view(-1)
+        u_emb_0 = self.users_feature[users]
+        b_emb_0 = self.bundles_feature[bundles_flat]
+        
+        safe_items = self.bundle_items[bundles_flat].clamp(min=0)
+        i_emb_0 = self.items_feature[safe_items]
+        valid_mask = (self.bundle_items[bundles_flat] >= 0).float()
+        i_emb_0 = i_emb_0 * valid_mask.unsqueeze(-1)
+        
+        reg_loss = (1/2)*(u_emb_0.norm(2).pow(2) + 
+                          b_emb_0.norm(2).pow(2) + 
+                          i_emb_0.norm(2).pow(2)) / float(bs)
+
+        return bpr_loss, c_loss, reg_loss
 
     # ------------------------------------------------------------------
     # Inference  (evaluation)

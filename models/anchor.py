@@ -377,27 +377,19 @@ class AnchorRadar(nn.Module):
         e_i_UI_3d  = e_i_UI[safe_items]
         e_i_BI_3d  = e_i_BI[safe_items]
 
-        # ---- Stage 1: local score — cosine similarity based MLP input ----
-        # L2-normalise all embedding vectors before cross-view dot products
-        eu_UB_n = F.normalize(e_u_UB_3d,  p=2, dim=-1)  # [bs_total, max_T, D]
-        eu_UI_n = F.normalize(e_u_UI_3d,  p=2, dim=-1)
-        ei_UI_n = F.normalize(e_i_UI_3d,  p=2, dim=-1)
-        eb_UB_n = F.normalize(e_b_UB_3d,  p=2, dim=-1)
-        eb_BI_n = F.normalize(e_b_BI_3d,  p=2, dim=-1)
-        ei_BI_n = F.normalize(e_i_BI_3d,  p=2, dim=-1)
-
-        # 4 cosine similarities → each [bs_total, max_T, 1]
-        cos_eu_UB_ei_UI = (eu_UB_n * ei_UI_n).sum(-1, keepdim=True)  # cross-view
-        cos_eu_UI_ei_UI = (eu_UI_n * ei_UI_n).sum(-1, keepdim=True)  # same-view
-        cos_eb_UB_ei_UI = (eb_UB_n * ei_UI_n).sum(-1, keepdim=True)  # cross-view
-        cos_eb_BI_ei_BI = (eb_BI_n * ei_BI_n).sum(-1, keepdim=True)  # same-view
+        # ---- Stage 1: local score — dot product based MLP input ----
+        # 4 dot products → each [bs_total, max_T, 1]
+        dot_eu_UB_ei_UI = (e_u_UB_3d * e_i_UI_3d).sum(-1, keepdim=True)  # cross-view
+        dot_eu_UI_ei_UI = (e_u_UI_3d * e_i_UI_3d).sum(-1, keepdim=True)  # same-view
+        dot_eb_UB_ei_UI = (e_b_UB_3d * e_i_UI_3d).sum(-1, keepdim=True)  # cross-view
+        dot_eb_BI_ei_BI = (e_b_BI_3d * e_i_BI_3d).sum(-1, keepdim=True)  # same-view
 
         # MLP input: [bs_total, max_T, 9]
         mlp_input = torch.cat([
-            cos_eu_UB_ei_UI,   # 1
-            cos_eu_UI_ei_UI,   # 1
-            cos_eb_UB_ei_UI,   # 1
-            cos_eb_BI_ei_BI,   # 1
+            dot_eu_UB_ei_UI,   # 1
+            dot_eu_UI_ei_UI,   # 1
+            dot_eb_UB_ei_UI,   # 1
+            dot_eb_BI_ei_BI,   # 1
             topo,              # 5
         ], dim=-1)             # [bs_total, max_T, 9]
 
@@ -421,12 +413,27 @@ class AnchorRadar(nn.Module):
         # Base: <e_u^UB, e_b^UB>  [bs_total]
         score_base = (e_u_UB_exp * e_b_UB[bundles_flat]).sum(dim=-1)
 
-        # Item part: Σ_i α_{u,i,B} · <e_u^UI, e_i^UI>
+        # Item part: sum_i alpha_{u,i,B} * <e_u^UI, e_i^UI>
         ui_dot = (e_u_UI_3d * e_i_UI_3d).sum(dim=-1)      # [bs_total, max_T]
         score_item = (alpha * ui_dot).sum(dim=-1)           # [bs_total]
 
         scores = (score_base + score_item).view(bs, n_neg1) # [bs, 1+neg]
-        return scores
+
+        # ---- Logging values (Mean Absolute Values) ----
+        mean_abs_base = score_base.abs().mean()
+        mean_abs_item = score_item.abs().mean()
+
+        # ---- Entropy for regularization ----
+        # H = -sum(alpha * log(alpha))
+        eps = 1e-9
+        a_clamp = alpha.clamp(min=eps)
+        H = -(a_clamp * a_clamp.log()).sum(dim=-1)          # [bs_total]
+        # Normalize by log(bundle_size) to keep it in [0, 1]
+        sizes = b_mask.float().sum(dim=-1).clamp(min=1)
+        H_norm = H / (sizes.log() + eps)                    # [bs_total]
+        mean_entropy = H_norm.mean()                        # Scalar
+
+        return scores, mean_entropy, mean_abs_base, mean_abs_item
 
     # ------------------------------------------------------------------
     # Contrastive loss (InfoNCE, same as MultiCBR)
@@ -464,13 +471,17 @@ class AnchorRadar(nn.Module):
         # Topology features & mask
         topo, b_mask = self._build_topo_features(users, bundles_flat)
 
-        # Scores
-        scores = self._score_bundles(users, bundles, embs, topo, b_mask)
+        # Scores and stats
+        scores, mean_ent, mean_base, mean_item = self._score_bundles(
+            users, bundles, (e_u_UB, e_b_UB, e_u_UI, e_i_UI, e_b_BI, e_i_BI), topo, b_mask
+        )
+        
+        # BPR Loss 
+        pos_scores = scores[:, 0]
+        neg_scores = scores[:, 1:]
+        bpr_loss   = -torch.log(torch.sigmoid(pos_scores.unsqueeze(1) - neg_scores) + 1e-8).mean()
 
-        # BPR Loss
-        bpr_loss = cal_bpr_loss(scores)
-
-        # Contrastive Loss — skip entirely when c_lambda == 0
+        # Contrastive Loss (optional)
         c_lambda = self.conf.get("c_lambda", 0.0)
         if c_lambda > 0:
             u_cl = self._cal_c_loss(e_u_UB[users], e_u_UI[users])
@@ -479,7 +490,20 @@ class AnchorRadar(nn.Module):
         else:
             c_loss = torch.tensor(0.0, device=self.device)
 
-        return bpr_loss, c_loss
+        # BPR Regularization Loss (on 0-th layer embeddings)
+        u_emb_0 = self.users_feature[users]                 # [bs, D]
+        b_emb_0 = self.bundles_feature[bundles_flat]        # [bs*(1+neg), D]
+        
+        # safely gather item embeddings
+        safe_items = self.bundle_items_topo[bundles_flat].clamp(min=0)  
+        i_emb_0 = self.items_feature[safe_items]            # [bs*(1+neg), max_T, D]
+        i_emb_0 = i_emb_0 * b_mask.unsqueeze(-1).float()    # mask padded items
+        
+        reg_loss = (1/2)*(u_emb_0.norm(2).pow(2) + 
+                          b_emb_0.norm(2).pow(2) + 
+                          i_emb_0.norm(2).pow(2)) / float(bs)
+
+        return bpr_loss, c_loss, mean_ent, mean_base, mean_item, reg_loss
 
     # ------------------------------------------------------------------
     # Evaluation
@@ -568,19 +592,12 @@ class AnchorRadar(nn.Module):
             eb_UB_4d = eb_UB_u.unsqueeze(2).expand(nu, N, max_T, -1)
             eb_BI_4d = eb_BI_u.unsqueeze(2).expand(nu, N, max_T, -1)
 
-            # Stage 1 MLP — cosine similarity based, peak: [nu×N, max_T, 9]
-            eu_UB_n = F.normalize(eu_UB_4d, p=2, dim=-1)
-            eu_UI_n = F.normalize(eu_UI_4d, p=2, dim=-1)
-            ei_UI_n = F.normalize(ei_UI_4d, p=2, dim=-1)
-            eb_UB_n = F.normalize(eb_UB_4d, p=2, dim=-1)
-            eb_BI_n = F.normalize(eb_BI_4d, p=2, dim=-1)
-            ei_BI_n = F.normalize(ei_BI_4d, p=2, dim=-1)
-
+            # Stage 1 MLP — dot product based, peak: [nu×N, max_T, 9]
             mlp_in = torch.cat([
-                (eu_UB_n * ei_UI_n).sum(-1, keepdim=True),  # cos(euUB, eiUI)
-                (eu_UI_n * ei_UI_n).sum(-1, keepdim=True),  # cos(euUI, eiUI)
-                (eb_UB_n * ei_UI_n).sum(-1, keepdim=True),  # cos(ebUB, eiUI)
-                (eb_BI_n * ei_BI_n).sum(-1, keepdim=True),  # cos(ebBI, eiBI)
+                (eu_UB_4d * ei_UI_4d).sum(-1, keepdim=True),  # dot(euUB, eiUI)
+                (eu_UI_4d * ei_UI_4d).sum(-1, keepdim=True),  # dot(euUI, eiUI)
+                (eb_UB_4d * ei_UI_4d).sum(-1, keepdim=True),  # dot(ebUB, eiUI)
+                (eb_BI_4d * ei_BI_4d).sum(-1, keepdim=True),  # dot(ebBI, eiBI)
                 topo_u,                                      # 5 topo features
             ], dim=-1)                                       # [nu, N, max_T, 9]
             s1 = self.stage1_mlp(

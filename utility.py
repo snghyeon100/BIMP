@@ -156,6 +156,93 @@ class DSSBundleTrainDataset(BundleTrainDataset):
         valid = [b for b in candidates if b not in user_pos and b not in exclude_set]
         return random.choice(valid) if valid else None
 
+class AnchorBundleTrainDataset(BundleTrainDataset):
+    """
+    Item-Overlap Hard Negative Sampling for AnchorRadar.
+
+    hard_neg_prob 확률로 pos 번들과 아이템을 가장 많이 공유하는
+    번들 중 하나를 neg로 선택. 없으면 랜덤으로 fallback.
+
+    '아이폰+케이스 번들' → '아이폰+케이스+이어폰 번들'처럼
+    임베딩만으로 구별 어려운 negative → α gradient 강화.
+    """
+
+    def __init__(self, conf, u_b_pairs, u_b_graph, num_bundles,
+                 u_b_for_neg_sample, b_b_for_neg_sample,
+                 neg_sample=1, bundle_items_list=None,
+                 hard_neg_prob=0.5, top_k_pool=20):
+        super().__init__(conf, u_b_pairs, u_b_graph, num_bundles,
+                         u_b_for_neg_sample, b_b_for_neg_sample, neg_sample)
+        self.hard_neg_prob = hard_neg_prob
+        self.bundle_items_list = bundle_items_list  # list of list[int]
+
+        # item → bundles 역인덱스 (DSSBundleTrainDataset과 동일)
+        self.it_to_bundles = {}
+        if bundle_items_list is not None:
+            for b_idx, items in enumerate(bundle_items_list):
+                for it in items:
+                    if it < 0:
+                        continue
+                    self.it_to_bundles.setdefault(it, []).append(b_idx)
+
+        # pos_bundle → top-K overlap bundles (precomputed for speed)
+        # overlap_map[b] = list of bundle indices sorted by desc overlap count
+        print("  AnchorBundleTrainDataset: precomputing overlap map ...")
+        self.overlap_map = self._build_overlap_map(top_k_pool)
+        print(f"  Done. top_k_pool={top_k_pool}, hard_neg_prob={hard_neg_prob}")
+
+    def _build_overlap_map(self, top_k):
+        """For each bundle b, find top_k most-overlapping other bundles."""
+        overlap_map = {}
+        if self.bundle_items_list is None:
+            return overlap_map
+        for b_idx, items in enumerate(self.bundle_items_list):
+            counter = {}
+            for it in items:
+                if it < 0:
+                    continue
+                for other_b in self.it_to_bundles.get(it, []):
+                    if other_b != b_idx:
+                        counter[other_b] = counter.get(other_b, 0) + 1
+            if counter:
+                sorted_b = sorted(counter, key=lambda x: -counter[x])[:top_k]
+                overlap_map[b_idx] = sorted_b
+        return overlap_map
+
+    def __getitem__(self, index):
+        user_b, pos_bundle = self.u_b_pairs[index]
+        all_bundles = [pos_bundle]
+        all_set = {pos_bundle}
+        user_pos = set(self.u_b_graph.getrow(user_b).indices.tolist())
+
+        while len(all_bundles) < self.neg_sample + 1:
+            # hard_neg_prob 확률로 Item-Overlap Hard Negative 시도
+            if (self.bundle_items_list is not None
+                    and np.random.random() < self.hard_neg_prob):
+                hard = self._sample_overlap_negative(user_pos, pos_bundle, all_set)
+                if hard is not None:
+                    all_bundles.append(hard)
+                    all_set.add(hard)
+                    continue
+
+            # Fallback: 랜덤 Easy Negative
+            while True:
+                i = np.random.randint(self.num_bundles)
+                if i not in user_pos and i not in all_set:
+                    all_bundles.append(i)
+                    all_set.add(i)
+                    break
+
+        return torch.LongTensor([user_b]), torch.LongTensor(all_bundles)
+
+    def _sample_overlap_negative(self, user_pos, pos_bundle, exclude_set):
+        """precomputed overlap_map에서 valid한 hard negative 하나 반환."""
+        candidates = self.overlap_map.get(pos_bundle, [])
+        valid = [b for b in candidates
+                 if b not in user_pos and b not in exclude_set]
+        return random.choice(valid) if valid else None
+
+
 class Datasets():
     def __init__(self, conf):
         self.path = conf['data_path']
@@ -363,10 +450,10 @@ class AnchorDatasets(Datasets):
         load_conf["dataset"] = base_name
         super().__init__(load_conf)
 
-        self._compute_anchor_info()
+        self._compute_anchor_info(conf)
 
     # ------------------------------------------------------------------
-    def _compute_anchor_info(self):
+    def _compute_anchor_info(self, conf):
         print("=" * 50)
         print("AnchorDatasets: computing anchor info ...")
 
@@ -426,6 +513,30 @@ class AnchorDatasets(Datasets):
             "ui_csr":           u_i_graph,         # scipy CSR
             "b_i_csr":          b_i_csr,           # scipy CSR
         }
+
+        # Replace train_loader with AnchorBundleTrainDataset (Item-Overlap neg)
+        hard_neg_prob = conf.get("hard_neg_prob", 0.5)
+        top_k_pool    = conf.get("hard_neg_top_k", 20)
+
+        anchor_train_data = AnchorBundleTrainDataset(
+            self.bundle_train_data.conf,
+            self.bundle_train_data.u_b_pairs,
+            self.graphs[0],          # UB train CSR
+            self.num_bundles,
+            None, None,
+            neg_sample=self.bundle_train_data.neg_sample,
+            bundle_items_list=bundle_items_list,
+            hard_neg_prob=hard_neg_prob,
+            top_k_pool=top_k_pool,
+        )
+        batch_size_train = conf.get("batch_size_train", 2048)
+        self.train_loader = torch.utils.data.DataLoader(
+            anchor_train_data,
+            batch_size=batch_size_train,
+            shuffle=True,
+            num_workers=2,
+            drop_last=True,
+        )
 
         print("AnchorDatasets: done.")
         print("=" * 50)
