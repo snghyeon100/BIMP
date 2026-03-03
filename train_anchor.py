@@ -196,7 +196,8 @@ def test(model, dataloader, conf):
             users = users.to(device)
             pred_b = model.evaluate(eval_info, users)
             pred_b -= 1e8 * train_mask_u_b.to(device)
-            tmp_metrics = get_metrics(tmp_metrics, ground_truth_u_b, pred_b, conf["topk"])
+            # ground_truth is on CPU; bring pred to CPU for indexing
+            tmp_metrics = get_metrics(tmp_metrics, ground_truth_u_b, pred_b.cpu(), conf["topk"])
 
     metrics = {}
     for m, topk_res in tmp_metrics.items():
@@ -284,12 +285,14 @@ def log_metrics(conf, model, metrics, run,
 
 
 def get_metrics(metrics, grd, pred, topks):
+    """grd is CPU tensor; pred may be CPU or GPU â†' normalise to CPU."""
+    pred = pred.cpu()
     tmp = {"recall": {}, "ndcg": {}}
     for topk in topks:
         _, col_indice = torch.topk(pred, topk)
         row_indice = (
             torch.zeros_like(col_indice)
-            + torch.arange(pred.shape[0], device=pred.device, dtype=torch.long).view(-1, 1)
+            + torch.arange(pred.shape[0], dtype=torch.long).view(-1, 1)
         )
         is_hit = grd[row_indice.view(-1), col_indice.view(-1)].view(-1, topk)
         tmp["recall"][topk] = get_recall(pred, grd, is_hit, topk)
@@ -312,25 +315,25 @@ def get_recall(pred, grd, is_hit, topk):
 
 
 def get_ndcg(pred, grd, is_hit, topk):
-    def DCG(hit, topk, device):
-        hit = hit / torch.log2(torch.arange(2, topk + 2, device=device, dtype=torch.float))
+    """All tensors expected on CPU."""
+    def DCG(hit, topk):
+        hit = hit / torch.log2(torch.arange(2, topk + 2, dtype=torch.float))
         return hit.sum(-1)
 
-    def IDCG(num_pos, topk, device):
+    def IDCG(num_pos, topk):
         hit = torch.zeros(topk, dtype=torch.float)
         hit[:num_pos] = 1
-        return DCG(hit, topk, device)
+        return DCG(hit, topk)
 
-    device = grd.device
-    IDCGs  = torch.empty(1 + topk, dtype=torch.float)
+    IDCGs = torch.empty(1 + topk, dtype=torch.float)
     IDCGs[0] = 1
     for i in range(1, topk + 1):
-        IDCGs[i] = IDCG(i, topk, device)
+        IDCGs[i] = IDCG(i, topk)
 
     num_pos = grd.sum(dim=1).clamp(0, topk).to(torch.long)
-    dcg     = DCG(is_hit, topk, device)
+    dcg     = DCG(is_hit, topk)
     idcg    = IDCGs[num_pos]
-    ndcg    = dcg / idcg.to(device)
+    ndcg    = dcg / idcg
 
     denorm = pred.shape[0] - (num_pos == 0).sum().item()
     nomina = ndcg.sum().item()

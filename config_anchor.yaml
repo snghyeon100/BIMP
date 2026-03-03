@@ -21,6 +21,7 @@ NetEase:
 
   epochs: 50
   test_interval: 5
+  eval_bundle_chunk: 512  # bundle chunk size in evaluate() — reduce if OOM
 
 
 iFashion:
@@ -44,6 +45,7 @@ iFashion:
 
   epochs: 50
   test_interval: 5
+  eval_bundle_chunk: 512
 
 
 Youshu:
@@ -67,3 +69,4 @@ Youshu:
 
   epochs: 100
   test_interval: 5
+  eval_bundle_chunk: 512

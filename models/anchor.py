@@ -469,79 +469,120 @@ class AnchorRadar(nn.Module):
     # Evaluation
     # ------------------------------------------------------------------
 
-    def evaluate(self, embs_and_info, users):
+    def evaluate(self, eval_cache, users):
         """
-        Full U×B score matrix for evaluation.
+        Full personalised U×B score matrix using Stage 1+2 attention.
 
-        embs_and_info : output of get_all_embeddings_for_eval()
-        users         : [batch] user indices
+        eval_cache: output of get_all_embeddings_for_eval()
+        users      : [bs_eval] user indices (on device)
+
+        Returns scores: [bs_eval, N_bundles]
         """
-        (e_u_UB, e_b_UB, e_u_UI, e_i_UI, e_b_BI, e_i_BI), \
-        alpha_all = embs_and_info                           # alpha: [N_b, max_T]
+        embs, precomp = eval_cache
+        e_u_UB, e_b_UB, e_u_UI, e_i_UI, e_b_BI, e_i_BI = embs
+        # precomp: dict with pre-sliced bundle-level tensors
+        e_i_UI_bun = precomp["e_i_UI_bun"]   # [N_b, max_T, D]
+        e_i_BI_bun = precomp["e_i_BI_bun"]   # [N_b, max_T, D]
+        e_b_UB_bun = precomp["e_b_UB_bun"]   # [N_b, D]
+        e_b_BI_bun = precomp["e_b_BI_bun"]   # [N_b, D]
+        topo_bun   = precomp["topo_bun"]      # [N_b, max_T, 5]   affinity/overlap = 0
+        s2         = precomp["s2"]            # [N_b, max_T]
+        mask       = self.bundle_mask_topo    # [N_b, max_T]
 
-        # Base score: U × B  matrix  [|users|, N_bundles]
-        score_base = e_u_UB[users] @ e_b_UB.T              # [|U|, N_B]
+        N_b     = self.num_bundles
+        max_T   = self.bundle_items_topo.shape[1]
+        D       = self.emb_size
+        bs_eval = users.shape[0]
+        chunk   = self.conf.get("eval_bundle_chunk", 512)
+        INF     = 1e9
 
-        # Item contribution: for each bundle b, Σ_i α_{b,i} · e_i^UI (pre-weighted)
-        # bundle_item_repr [N_b, D] = Σ_i α * e_i^UI
-        safe_items = self.bundle_items_topo.clamp(min=0)    # [N_b, max_T]
-        e_i_UI_all = e_i_UI[safe_items]                     # [N_b, max_T, D]
-        bundle_repr = (alpha_all.unsqueeze(-1) * e_i_UI_all).sum(dim=1)  # [N_b, D]
+        score_base = e_u_UB[users] @ e_b_UB.T  # [bs_eval, N_b]
+        score_item = torch.zeros(bs_eval, N_b, device=self.device)
 
-        # [|U|, D] × [D, N_B] -> [|U|, N_B]
-        score_item = e_u_UI[users] @ bundle_repr.T
+        for b_start in range(0, N_b, chunk):
+            b_end = min(b_start + chunk, N_b)
+            nb    = b_end - b_start
+
+            # Bundle-side tensors for this chunk  [nb, max_T, D]
+            e_i_UI_c = e_i_UI_bun[b_start:b_end]   # [nb, max_T, D]
+            e_i_BI_c = e_i_BI_bun[b_start:b_end]
+            e_b_UB_c = e_b_UB_bun[b_start:b_end]   # [nb, D]
+            e_b_BI_c = e_b_BI_bun[b_start:b_end]
+            topo_c   = topo_bun[b_start:b_end]      # [nb, max_T, 5]
+            s2_c     = s2[b_start:b_end]             # [nb, max_T]
+            mask_c   = mask[b_start:b_end]           # [nb, max_T]
+
+            # Expand user embs: [bs_eval, D] -> [bs_eval, nb, max_T, D]
+            eu_UB = e_u_UB[users].unsqueeze(1).unsqueeze(2).expand(-1, nb, max_T, -1)
+            eu_UI = e_u_UI[users].unsqueeze(1).unsqueeze(2).expand(-1, nb, max_T, -1)
+
+            # Expand bundle tensors: [nb, max_T, D] -> [bs_eval, nb, max_T, D]
+            ei_UI = e_i_UI_c.unsqueeze(0).expand(bs_eval, -1, -1, -1)
+            ei_BI = e_i_BI_c.unsqueeze(0).expand(bs_eval, -1, -1, -1)
+            eb_UB = e_b_UB_c.unsqueeze(0).unsqueeze(2).expand(bs_eval, -1, max_T, -1)
+            eb_BI = e_b_BI_c.unsqueeze(0).unsqueeze(2).expand(bs_eval, -1, max_T, -1)
+            topo  = topo_c.unsqueeze(0).expand(bs_eval, -1, -1, -1)   # [bs, nb, max_T, 5]
+
+            # Stage 1 MLP  — reshape to [bs_eval*nb, max_T, 5D+5]
+            mlp_in = torch.cat([eu_UB, eu_UI, ei_UI, eb_UB, eb_BI, topo], dim=-1)
+            bs_nb  = bs_eval * nb
+            s1_c   = self.stage1_mlp(mlp_in.view(bs_nb, max_T, -1)).squeeze(-1)  # [bs*nb, max_T]
+            s1_c   = s1_c.view(bs_eval, nb, max_T)
+
+            # Stage 2 is bundle-only, broadcast over users
+            s2_exp = s2_c.unsqueeze(0).expand(bs_eval, -1, -1)          # [bs, nb, max_T]
+            combined = s1_c + self.anchor_lambda * s2_exp                 # [bs, nb, max_T]
+
+            mask_exp = mask_c.unsqueeze(0).expand(bs_eval, -1, -1)       # [bs, nb, max_T]
+            combined = combined.masked_fill(~mask_exp, -INF)
+            alpha    = F.softmax(combined, dim=-1) * mask_exp.float()     # [bs, nb, max_T]
+
+            # Item score: Σ_i α · <e_u^UI, e_i^UI>
+            ui_dot   = (eu_UI * ei_UI).sum(dim=-1)                        # [bs, nb, max_T]
+            score_item[:, b_start:b_end] = (alpha * ui_dot).sum(dim=-1)  # [bs, nb]
 
         return score_base + score_item
 
     def get_all_embeddings_for_eval(self):
         """
-        Pre-compute embeddings and bundle-level anchor weights (using global avg user).
-        Called once before full-pass evaluation to avoid redundant computation.
+        Pre-compute everything that is INDEPENDENT of specific users.
+        Called ONCE before the full evaluation loop.
 
-        Returns (embs_tuple, alpha_all):
-          embs_tuple : 6 full-vocab embedding tensors
-          alpha_all  : [N_b, max_T]  — anchor weights averaged over the training users
-                       (label-free proxy for global importance at eval time)
+        Returns (embs, precomp):
+          embs    : 6 full-vocab embedding tensors
+          precomp : dict of pre-sliced bundle-level tensors
+                    (Stage 2 scores, item/bundle embeddings, zero'd topology)
+                    → used by evaluate() which adds Stage 1 per user-batch.
         """
         with torch.no_grad():
             embs = self.get_all_embeddings(test=True)
-            e_u_UB, e_b_UB, e_u_UI, e_i_UI, e_b_BI, e_i_BI = embs
+            _, e_b_UB, _, e_i_UI, e_b_BI, e_i_BI = embs
 
-            N_b   = self.num_bundles
-            max_T = self.bundle_items_topo.shape[1]
+            safe_items = self.bundle_items_topo.clamp(min=0)  # [N_b, max_T]
+            max_T      = self.bundle_items_topo.shape[1]
+            N_b        = self.num_bundles
 
-            safe_items   = self.bundle_items_topo.clamp(min=0)  # [N_b, max_T]
-            e_i_BI_all   = e_i_BI[safe_items]                   # [N_b, max_T, D]
+            e_i_UI_bun = e_i_UI[safe_items]                   # [N_b, max_T, D]
+            e_i_BI_bun = e_i_BI[safe_items]                   # [N_b, max_T, D]
 
-            # Stage 2 only (no user context needed — global strength)
-            s2 = self.stage2_linear(e_i_BI_all).squeeze(-1)     # [N_b, max_T]
+            # Stage 2: pre-compute per-bundle item scores  [N_b, max_T]
+            s2 = self.stage2_linear(e_i_BI_bun).squeeze(-1)   # [N_b, max_T]
 
-            # For Stage 1 at eval we use the mean user embedding as a proxy
-            mean_u_UB = e_u_UB.mean(dim=0, keepdim=True).expand(N_b, max_T, -1)  # [N_b, max_T, D]
-            mean_u_UI = e_u_UI.mean(dim=0, keepdim=True).expand(N_b, max_T, -1)
-
-            all_bundles = torch.arange(N_b, device=self.device)
-            e_b_UB_3d   = e_b_UB.unsqueeze(1).expand(-1, max_T, -1)  # [N_b, max_T, D]
-            e_b_BI_3d   = e_b_BI.unsqueeze(1).expand(-1, max_T, -1)
-
-            e_i_UI_all3 = e_i_UI[safe_items]                          # [N_b, max_T, D]
-
-            # Topology: we skip personal features (affinity / overlap) at eval
-            # and use only item-level topology for Stage 1
-            feat_pop  = self.item_pop_topo[safe_items]              # [N_b, max_T]
-            feat_spec = self.item_spec_topo[safe_items]             # [N_b, max_T]
-            feat_bsz  = self.bundle_size_topo.unsqueeze(1).expand(-1, max_T)
+            # Topology without personal features (affinity=0, overlap=0)
+            feat_pop  = self.item_pop_topo[safe_items]         # [N_b, max_T]
+            feat_spec = self.item_spec_topo[safe_items]        # [N_b, max_T]
+            feat_bsz  = self.bundle_size_topo.unsqueeze(1).expand(-1, max_T)  # [N_b, max_T]
             zeros     = torch.zeros(N_b, max_T, device=self.device)
+            topo_bun  = torch.stack([feat_pop, feat_bsz, feat_spec, zeros, zeros], dim=2)
 
-            topo_eval = torch.stack([feat_pop, feat_bsz, feat_spec, zeros, zeros], dim=2)
+            precomp = {
+                "e_i_UI_bun": e_i_UI_bun,   # [N_b, max_T, D]
+                "e_i_BI_bun": e_i_BI_bun,   # [N_b, max_T, D]
+                "e_b_UB_bun": e_b_UB,        # [N_b, D]
+                "e_b_BI_bun": e_b_BI,        # [N_b, D]
+                "topo_bun":   topo_bun,       # [N_b, max_T, 5]
+                "s2":         s2,             # [N_b, max_T]  Stage 2 pre-computed
+            }
 
-            mlp_input = torch.cat([
-                mean_u_UB, mean_u_UI, e_i_UI_all3, e_b_UB_3d, e_b_BI_3d, topo_eval
-            ], dim=-1)
-            s1 = self.stage1_mlp(mlp_input).squeeze(-1)            # [N_b, max_T]
+        return embs, precomp
 
-            combined = s1 + self.anchor_lambda * s2
-            combined = combined.masked_fill(~self.bundle_mask_topo, -1e9)
-            alpha_all = F.softmax(combined, dim=-1) * self.bundle_mask_topo.float()
-
-        return embs, alpha_all
