@@ -1,0 +1,69 @@
+NetEase:
+  data_path: './datasets'
+  batch_size_train: 2048
+  batch_size_test: 2048
+  topk: [10, 20, 40, 80]
+  neg_num: 1
+
+  embedding_sizes: [64]
+  num_layerss: [2]
+
+  # AnchorRadar-specific
+  anchor_lambdas: [0.1]   # λ: weight for Stage2 global score (s1 + λ·s2)
+  mlp_hidden_size: 64     # Stage1 MLP hidden dimension
+
+  lrs: [1.0e-3]
+  l2_regs: [1.0e-5]
+
+  # Contrastive loss (set c_lambda: 0 for BPR-only)
+  c_lambdas: [0.05]
+  c_temps: [0.2]
+
+  epochs: 50
+  test_interval: 5
+
+
+iFashion:
+  data_path: './datasets'
+  batch_size_train: 2048
+  batch_size_test: 2048
+  topk: [10, 20, 40, 80]
+  neg_num: 1
+
+  embedding_sizes: [64]
+  num_layerss: [2]
+
+  anchor_lambdas: [0.1]
+  mlp_hidden_size: 64
+
+  lrs: [1.0e-3]
+  l2_regs: [1.0e-5]
+
+  c_lambdas: [0.05]
+  c_temps: [0.2]
+
+  epochs: 50
+  test_interval: 5
+
+
+Youshu:
+  data_path: './datasets'
+  batch_size_train: 2048
+  batch_size_test: 2048
+  topk: [10, 20, 40, 80]
+  neg_num: 1
+
+  embedding_sizes: [64]
+  num_layerss: [2]
+
+  anchor_lambdas: [0.1]
+  mlp_hidden_size: 64
+
+  lrs: [1.0e-3]
+  l2_regs: [1.0e-5]
+
+  c_lambdas: [0.05]
+  c_temps: [0.2]
+
+  epochs: 100
+  test_interval: 5

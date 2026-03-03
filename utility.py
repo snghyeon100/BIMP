@@ -336,3 +336,91 @@ class DSSDatasets(Datasets):
 
         print("DSSDatasets: done.")
         print("=" * 50)
+
+
+# ===========================================================================
+# AnchorDatasets  — extends Datasets with anchor-specific precomputed stats
+# ===========================================================================
+
+class AnchorDatasets(Datasets):
+    """
+    Extends Datasets to precompute topology features needed by AnchorRadar:
+      - item_popularity   : d_i  — number of bundles containing item i  [N_items]
+      - bundle_size       : |B|  — number of items in each bundle        [N_bundles]
+      - item_specificity  : 1/(d_i + eps)                                [N_items]
+      - bundle_items      : padded item-index tensor  [N_bundles, max_items]
+      - bundle_mask       : bool mask (True = valid)  [N_bundles, max_items]
+      - ui_csr            : user-item CSR matrix  (kept as scipy sparse for overlap calc)
+
+    Everything is stored in `self.anchor_info` and passed to AnchorRadar.__init__.
+    """
+
+    def __init__(self, conf):
+        # Data files live in the base dataset folder.
+        # Strip any suffix (e.g. "_Anchor") so parent loads paths correctly.
+        load_conf = dict(conf)
+        base_name = conf["dataset"].split("_")[0]
+        load_conf["dataset"] = base_name
+        super().__init__(load_conf)
+
+        self._compute_anchor_info()
+
+    # ------------------------------------------------------------------
+    def _compute_anchor_info(self):
+        print("=" * 50)
+        print("AnchorDatasets: computing anchor info ...")
+
+        b_i_graph = self.graphs[2]   # [N_bundles, N_items]  CSR
+        u_i_graph = self.graphs[1]   # [N_users,   N_items]  CSR
+
+        b_i_csr = b_i_graph.tocsr()
+        eps = 1e-8
+
+        # ---- 1. Item popularity: how many bundles contain item i ----
+        # b_i_graph column sum → [N_items]
+        item_pop = np.array(b_i_csr.sum(axis=0)).ravel().astype(np.float32)  # [N_items]
+
+        # ---- 2. Bundle-items padded tensor + mask ----
+        max_items = 0
+        bundle_items_list = []
+        for b in range(self.num_bundles):
+            items = b_i_csr[b].indices.tolist()
+            bundle_items_list.append(items)
+            max_items = max(max_items, len(items))
+        max_items = max(max_items, 1)
+
+        bundle_items_t = torch.full((self.num_bundles, max_items), -1, dtype=torch.long)
+        bundle_mask_t  = torch.zeros(self.num_bundles, max_items, dtype=torch.bool)
+        bsize_t        = torch.zeros(self.num_bundles, dtype=torch.float32)
+
+        print(f"  Building bundle_items tensor (max_items={max_items}) ...")
+        for b, items in enumerate(bundle_items_list):
+            n = len(items)
+            bsize_t[b] = float(n)
+            if n > 0:
+                bundle_items_t[b, :n] = torch.tensor(items, dtype=torch.long)
+                bundle_mask_t[b,  :n] = True
+
+        # ---- 3. Derived features ----
+        item_pop_t        = torch.tensor(item_pop,           dtype=torch.float32)  # [N_items]
+        item_spec_t       = 1.0 / (item_pop_t + eps)                               # [N_items]
+
+        # Normalise popularity and bundle size to [0,1] for MLP stability
+        item_pop_norm     = item_pop_t  / (item_pop_t.max()  + eps)                # [N_items]
+        bsize_norm        = bsize_t     / (bsize_t.max()     + eps)                # [N_bundles]
+        item_spec_norm    = item_spec_t / (item_spec_t.max() + eps)                # [N_items]
+
+        self.anchor_info = {
+            # core tensors
+            "bundle_items":     bundle_items_t,    # [N_b, max_items]  -1=pad
+            "bundle_mask":      bundle_mask_t,     # [N_b, max_items]  bool
+            "bundle_size":      bsize_norm,        # [N_b]
+            "item_popularity":  item_pop_norm,     # [N_items]
+            "item_specificity": item_spec_norm,    # [N_items]
+            # keep raw scipy sparse for overlap computation in model
+            "ui_csr":           u_i_graph,         # scipy CSR
+            "b_i_csr":          b_i_csr,           # scipy CSR
+        }
+
+        print("AnchorDatasets: done.")
+        print("=" * 50)
