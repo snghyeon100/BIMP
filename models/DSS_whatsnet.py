@@ -660,8 +660,8 @@ class DSS(nn.Module):
             n_act_mean  = valid_act.sum(1).float().mean().item()
             n_ext_mean  = valid_ext.sum(1).float().mean().item()
             n_use_mean  = valid_comb.sum(1).float().mean().item()
-            print(f"[B2I ctx] mean |N_act|={n_act_mean:.1f}  "
-                  f"|N_extra|={n_ext_mean:.1f}  |N_use|={n_use_mean:.1f}")
+            #print(f"[B2I ctx] mean |N_act|={n_act_mean:.1f}  "
+                  #f"|N_extra|={n_ext_mean:.1f}  |N_use|={n_use_mean:.1f}")
             self._log_extra_once = False
 
         # ------------------------------------------------------------------
@@ -1079,8 +1079,8 @@ class DSS(nn.Module):
             # --- Precompute k_proj / v_proj ONCE for all bundles ---
             # (avoid recomputing NB Linear forwards per user chunk)
             V_b_c = V_b_all.contiguous()                               # [NB, n_t, d]
-            k_all = self.Wk_s2(V_b_c)                                 # [NB, n_t, d]
-            v_all = self.Wv_s2(V_b_c)                                 # [NB, n_t, d]
+            k_all = V_b_c                                              # [NB, n_t, d]
+            v_all = V_b_c                                              # [NB, n_t, d]
 
             # valid mask: [NB, n_t]  (True = real token)
             # Pre-fill -inf where invalid so we can simply add to logits
@@ -1093,7 +1093,7 @@ class DSS(nn.Module):
                 eu_UI = UI_u_all[u0:u1]                                # [uc, d]
                 eu_UB = UB_u_all[u0:u1]                                # [uc, d]
                 q_uc  = self._user_query(eu_UI, eu_UB)                 # [uc, d]
-                q_proj = self.Wq_s2(q_uc)                             # [uc, d]
+                q_proj = q_uc                                          # [uc, d]
 
                 # logits: [uc, NB, n_t]  (no expand of V tensors needed)
                 logits = torch.einsum('ud,bnd->ubn', q_proj, k_all)
