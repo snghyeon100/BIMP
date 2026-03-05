@@ -93,15 +93,8 @@ class MAB(nn.Module):
         self.h  = num_heads
         self.hd = d // num_heads
 
-        self.W_q = nn.Linear(d, d, bias=False)
-        self.W_k = nn.Linear(d, d, bias=False)
         self.W_v = nn.Linear(d, d, bias=False)
-        self.W_o = nn.Linear(d, d, bias=False)
         self.ln1 = nn.LayerNorm(d)
-        self.ln2 = nn.LayerNorm(d)
-        self.ff  = nn.Sequential(
-            nn.Linear(d, d), nn.ReLU(), nn.Linear(d, d)
-        )
         self.attn_drop = nn.Dropout(p=attn_drop)
         self.scale = math.sqrt(self.hd)
 
@@ -110,8 +103,8 @@ class MAB(nn.Module):
         n_k       = Y.shape[1]
         h, hd     = self.h, self.hd
 
-        Q = self.W_q(X).view(B, n_q, h, hd).transpose(1, 2)   # [B, h, n_q, hd]
-        K = self.W_k(Y).view(B, n_k, h, hd).transpose(1, 2)   # [B, h, n_k, hd]
+        Q = X.view(B, n_q, h, hd).transpose(1, 2)             # [B, h, n_q, hd]
+        K = Y.view(B, n_k, h, hd).transpose(1, 2)             # [B, h, n_k, hd]
         V = self.W_v(Y).view(B, n_k, h, hd).transpose(1, 2)   # [B, h, n_k, hd]
 
         attn = torch.matmul(Q, K.transpose(-2, -1)) / self.scale   # [B, h, n_q, n_k]
@@ -123,10 +116,9 @@ class MAB(nn.Module):
 
         out = torch.matmul(attn, V)                                  # [B, h, n_q, hd]
         out = out.transpose(1, 2).contiguous().view(B, n_q, d)
-        out = self.W_o(out)
 
         H = self.ln1(X + out)           # residual + layer-norm
-        return self.ln2(H + self.ff(H)) # feed-forward + residual + layer-norm
+        return H                        # removed feed-forward + second layer-norm
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +242,10 @@ class DSS(nn.Module):
         nn.init.xavier_normal_(self.bimp_I)
 
         # ------------------------------------------------------------------
-        # §6 Stage2 Q/K/V projections
+        # §1.4 Stage 2 (user queries bundle tokens)
+        # Note: Projections Wq_s2, Wk_s2, Wv_s2 have been removed for
+        # Light-Attention parameter reduction to combat overfitting.
         # ------------------------------------------------------------------
-        self.Wq_s2 = nn.Linear(d, d, bias=False)
-        self.Wk_s2 = nn.Linear(d, d, bias=False)
-        self.Wv_s2 = nn.Linear(d, d, bias=False)
 
         # ------------------------------------------------------------------
         # §7 Baseline residual scalar λ = sigmoid(logit_lambda)
@@ -487,10 +478,8 @@ class DSS(nn.Module):
             valid_c  = (items_c >= 0)                       # [uc, n_t]  bool
             items_cs = items_c.clamp(min=0)
 
-            # Z_{i,b} = X_i^(l-1) + W_pe * PE(i,b)
+            # Z_{i,b} = X_i^(l-1)
             Z_c   = X_i_g[items_cs]                         # [uc, n_t, d]
-            pe_c  = self._compute_pe(items_cs, valid_c)     # [uc, n_t, d]
-            Z_c   = Z_c + pe_c
             Z_c   = Z_c.masked_fill(~valid_c.unsqueeze(-1), 0.0)
 
             # WithinATT: V_b = MAB(Z, MAB(I, Z))
@@ -654,37 +643,12 @@ class DSS(nn.Module):
         # ------------------------------------------------------------------
         bundles_uniq_g = self._cur_bundles_uniq_global       # [U] global ids
 
-        def _pe_emb(neigh_pad, valid_mask, global_ids_fn):
-            """PE for a set of [A, n_k] neighbour slots."""
-            n_k  = neigh_pad.shape[1]
-            gids = global_ids_fn(neigh_pad)                  # [A, n_k] global ids
-            bd   = self.bundle_degree[gids]                  # [A, n_k]
-
-            def _rank_norm(deg, vmask):
-                deg_f = deg.float().masked_fill(~vmask, -1.0)
-                order = deg_f.argsort(dim=-1, descending=True)
-                rank  = torch.zeros_like(deg_f)
-                rank.scatter_(1, order,
-                    torch.arange(n_k, dtype=torch.float, device=self.device)
-                        .unsqueeze(0).expand(A, -1))
-                n_val = vmask.sum(1, keepdim=True).float().clamp(min=2) - 1
-                return (rank / n_val).clamp(0, 1).masked_fill(~vmask, 0.0)
-
-            rk  = _rank_norm(bd, valid_mask)
-            rev = (1.0 - rk).masked_fill(~valid_mask, 0.0)
-            pe  = self.W_pe(torch.stack([rk, rk, rev], dim=-1))  # [A, n_k, d]
-            return pe
-
         # Active embeddings
-        pe_act  = _pe_emb(neigh_act, valid_act,
-                          lambda p: bundles_uniq_g[p.clamp(0, bundles_uniq_g.shape[0]-1)])
-        E_act   = H_b_loc[neigh_act.clamp(0, H_b_loc.shape[0]-1)] + pe_act
+        E_act   = H_b_loc[neigh_act.clamp(0, H_b_loc.shape[0]-1)]
         E_act   = E_act.masked_fill(~valid_act.unsqueeze(-1), 0.0)
 
         # Extra embeddings (h_b^0, global ids)
-        pe_ext  = _pe_emb(neigh_ext, valid_ext,
-                          lambda p: p.clamp(0, H_b_init_full.shape[0]-1))
-        E_ext   = H_b_init_full[neigh_ext.clamp(0, H_b_init_full.shape[0]-1)] + pe_ext
+        E_ext   = H_b_init_full[neigh_ext.clamp(0, H_b_init_full.shape[0]-1)]
         E_ext   = E_ext.masked_fill(~valid_ext.unsqueeze(-1), 0.0)
 
         # Concatenate along token dim
@@ -790,15 +754,12 @@ class DSS(nn.Module):
         items_loc_cs  = items_loc_2d.clamp(min=0)
         items_loc_idx = i_global2local[items_loc_cs].clamp(min=0) # [U, n_t] local item idx
 
-        # PE is also loop-invariant (depends only on item degrees, not layer states)
-        pe_loc = self._compute_pe(items_loc_cs, valid_loc)        # [U, n_t, d]
-
         last_V_b_loc = None   # will hold the final-layer I→B WithinATT output
 
         for _ in range(self.num_bimp_layers):
             # ------ (A) I→B  (local) ------
             Z_loc   = X_i_loc[items_loc_idx]                          # [U, n_t, d]
-            Z_loc   = (Z_loc + pe_loc).masked_fill(~valid_loc.unsqueeze(-1), 0.0)
+            Z_loc   = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
 
             V_b_loc = self._within_att(self.mab_i2b_within, self.mab_i2b_outer,
                                        Z_loc, valid_loc)              # [U, n_t, d]
@@ -817,10 +778,15 @@ class DSS(nn.Module):
                     b_global2local, train)                             # [V, d]
 
         # ------------------------------------------------------------------
-        # Stage2 bundle tokens: use the last I→B WithinATT output \tilde{Z}_b
-        # Shape: [U, n_t, d] — same as before, padding already zeroed by masked_fill
+        # Stage2 bundle tokens: Use BIMP output or pre-BIMP snapshot
+        # shape: [U, n_t, d] (padding will be masked)
         # ------------------------------------------------------------------
-        V_b_tokens = last_V_b_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
+        if use_bimp_vb:
+            V_b_raw = last_V_b_loc
+        else:
+            V_b_raw = X_i_init_loc[items_loc_idx]  # Use pristine items
+
+        V_b_tokens = V_b_raw.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
         valid_V    = valid_loc                                         # [U, n_t]
 
         # ------------------------------------------------------------------
@@ -885,22 +851,19 @@ class DSS(nn.Module):
 
         # Ensure contiguous layout — bmm / Wk fail on non-contiguous strides
         V_b     = V_b.contiguous()
-        q_proj  = self.Wq_s2(q_flat)                   # [M, d]
-        k_proj  = self.Wk_s2(V_b)                      # [M, n_t, d]
-        v_proj  = self.Wv_s2(V_b)                      # [M, n_t, d]
-
-        # logits = (Wq·q_u) · (Wk·token) / sqrt(d)
+        # logits = (q_u) · (token) / sqrt(d)
         logits = torch.bmm(
-            q_proj.unsqueeze(1).contiguous(),           # [M, 1, d]
-            k_proj.transpose(1, 2).contiguous()         # [M, d, n_t]
+            q_flat.unsqueeze(1).contiguous(),           # [M, 1, d]
+            V_b.transpose(1, 2).contiguous()            # [M, d, n_t]
         ).squeeze(1) / math.sqrt(d)                     # [M, n_t]
 
         logits = logits / tau
         logits = logits.masked_fill(~valid, float('-inf'))
         alpha  = torch.nan_to_num(F.softmax(logits, dim=-1), nan=0.0)  # [M, n_t]
+        self.last_alpha = alpha.detach() # Save for statistical analysis
 
-        h_bu   = (alpha.unsqueeze(-1) * v_proj).sum(1)   # [M, d]
-        s_new  = (q_proj * h_bu).sum(-1)                 # [M]
+        h_bu   = (alpha.unsqueeze(-1) * V_b).sum(1)      # [M, d] - direct mix of V_b
+        s_new  = (q_flat * h_bu).sum(-1)                 # [M]    - direct dot product
         return s_new
 
     # ------------------------------------------------------------------

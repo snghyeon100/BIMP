@@ -145,6 +145,7 @@ NetEase_DSS:
   use_bimp_vb_for_stage2: true  # ablation: false = pre-BIMP tokens for stage2
   bimp_eval_single_pass: true   # single-pass BIMP at eval (O(1) vs O(NB/BC) calls)
   max_item_K_i2b: 40            # I→B token limit: top-K items per bundle (by BI+UI degree)
+  lambda_weight: 1.0            # Fixed lambda weight to bypass learnable parameter
 
 
 iFashion_DSS:
@@ -186,6 +187,7 @@ iFashion_DSS:
   eval_bundle_chunk: 512
   use_bimp_vb_for_stage2: true
   bimp_eval_single_pass: true
+  lambda_weight: 1.0
 
 Youshu_DSS:
   data_path: './datasets'
@@ -193,16 +195,16 @@ Youshu_DSS:
   batch_size_test: 2048
   topk: [20, 40]
   neg_num: 1
-
+  lambda_weight: 0.2
   core_k: 1
   aug_type: "Noise"
   ed_interval: 1
   embedding_sizes: [64]
   num_layerss: [2]
 
-  UB_ratios: [0.2]
-  UI_ratios: [0.1]
-  BI_ratios: [0.1]
+  UB_ratios: [0.4]
+  UI_ratios: [0.4]
+  BI_ratios: [0.4]
 
   lrs: [1.0e-3]
   l2_regs: [1.0e-5]
@@ -216,7 +218,7 @@ Youshu_DSS:
 
   epochs: 100
   test_interval: 5
-
+  num_layers_options: [2]
   # WHATsNet bidirectional message passing
   beta_bi: 0.1
   K_bi_topk: 50
@@ -226,5 +228,7 @@ Youshu_DSS:
   eval_incident_K: 50
   bimp_tau: 0.5
   eval_bundle_chunk: 512
+  attn_drop: 0.5
   use_bimp_vb_for_stage2: true
   bimp_eval_single_pass: true
+  lambda_weight: 1.0

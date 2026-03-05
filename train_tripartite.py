@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_dss.py  —  Training script for the DSS model.
+train_tripartite.py  —  Training script for the DSS_Tripartite model.
 
-Follows the MultiCBR train.py structure with these additions:
-  - BPR loss + optional Contrastive loss (c_lambda=0 disables)
-  - Recall@20,40 / NDCG@20,40 evaluation
-  - Best model saved when BOTH Recall@20 AND NDCG@20 improve
-  - Group-wise analysis (Organic vs Contextual) at test time
-  - Score contribution analysis (S_base / S_syn / S_cont) at test time
+Trains the Coupled Heterogeneous GCN (Tripartite Circulation) model.
+- Uses BPR Loss over the unified tripartite embeddings
+- Evaluates against Recall / NDCG 
 """
 
 import os
@@ -24,7 +21,7 @@ import torch
 import torch.optim as optim
 
 from utility import DSSDatasets
-from models.DSS import DSS
+from models.DSS_Tripartite import DSS_Tripartite
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +32,7 @@ def get_cmd():
     parser = argparse.ArgumentParser()
     parser.add_argument("-g", "--gpu",     default="0",      type=str)
     parser.add_argument("-d", "--dataset", default="NetEase_DSS", type=str)
-    parser.add_argument("-m", "--model",   default="DSS",    type=str)
+    parser.add_argument("-m", "--model",   default="DSS_Tripartite",    type=str)
     parser.add_argument("-i", "--info",    default="",       type=str)
     return parser.parse_args()
 
@@ -51,7 +48,7 @@ def main():
     paras        = get_cmd().__dict__
     dataset_name = paras["dataset"]
 
-    assert paras["model"] == "DSS", "Use -m DSS for train_dss.py"
+    assert paras["model"] == "DSS_Tripartite", "Use -m DSS_Tripartite for train_tripartite.py"
 
     # Support "NetEase_DSS" → look up key "NetEase_DSS" in config
     key = dataset_name
@@ -89,9 +86,9 @@ def main():
 
         conf["l2_reg"]       = l2_reg
         conf["embedding_size"] = emb_size
-        conf["UB_ratio"]     = UB_ratio
-        conf["UI_ratio"]     = UI_ratio
-        conf["BI_ratio"]     = BI_ratio
+        conf["UB_ratio"]     = float(UB_ratio)
+        conf["UI_ratio"]     = float(UI_ratio)
+        conf["BI_ratio"]     = float(BI_ratio)
         conf["num_layers"]   = num_layers
         conf["c_lambda"]     = c_lambda
         conf["c_temp"]       = c_temp
@@ -103,8 +100,6 @@ def main():
         settings += ["Neg_%d" % conf["neg_num"], str(conf["batch_size_train"]),
                      str(lr), str(l2_reg), str(emb_size)]
         settings += [str(UB_ratio), str(UI_ratio), str(BI_ratio), str(num_layers)]
-        settings += [str(c_lambda), str(c_temp)]
-        settings += ["core%d" % conf.get("core_k", 1)]
 
         setting               = "_".join(settings)
         log_path              = log_path + "/" + setting
@@ -115,7 +110,7 @@ def main():
         run = SummaryWriter(run_path)
 
         # Model
-        model = DSS(conf, dataset.graphs, dataset.bundle_info).to(device)
+        model = DSS_Tripartite(conf, dataset.graphs, dataset.bundle_info).to(device)
         
         # Disable Adam weight decay because BPR model computes it manually
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
@@ -143,19 +138,18 @@ def main():
 
                 bpr_loss, c_loss, reg_loss = model(batch, ED_drop=ED_drop)
                 
-                loss = bpr_loss + c_lambda * c_loss + l2_reg * reg_loss
+                loss = bpr_loss + l2_reg * reg_loss # CD loss is skipped implicitly for Tripartite
                 
                 loss.backward()
                 optimizer.step()
 
                 run.add_scalar("loss_bpr", bpr_loss.detach(), batch_anchor)
-                run.add_scalar("loss_c",   c_loss.detach(),   batch_anchor)
                 run.add_scalar("loss_reg", (l2_reg * reg_loss).detach(), batch_anchor)
                 run.add_scalar("loss",     loss.detach(),     batch_anchor)
                 
                 pbar.set_description(
-                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f, reg: %.2e"
-                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item(), (l2_reg * reg_loss).item()))
+                    "epoch: %d, loss: %.4f, bpr: %.4f, reg: %.2e"
+                    % (epoch, loss.item(), bpr_loss.item(), (l2_reg * reg_loss).item()))
 
                 if (batch_anchor + 1) % test_interval_bs == 0:
                     metrics = {
@@ -168,7 +162,7 @@ def main():
                         epoch, batch_anchor, best_metrics, best_perform, best_epoch)
 
         # ------------------------------------------------------------------
-        # Final best-model evaluation (optional, just to confirm loading)
+        # Final best-model evaluation
         # ------------------------------------------------------------------
         print("\n" + "=" * 60)
         print("Training finished.")
@@ -281,7 +275,7 @@ def test(model, dataloader, conf):
 # ---------------------------------------------------------------------------
 
 def get_metrics(metrics, grd, pred, topks):
-    grd = grd.to(pred.device)   # ensure same device as pred (which may be on GPU)
+    grd = grd.to(pred.device)
     for topk in topks:
         _, cols = torch.topk(pred, topk)
         rows    = (torch.zeros_like(cols) +
@@ -309,12 +303,12 @@ def get_ndcg(pred, grd, is_hit, topk):
         return (hit / torch.log2(torch.arange(2, topk + 2, device=device, dtype=torch.float))).sum(-1)
 
     def IDCG(num_pos, topk, device):
-        h = torch.zeros(topk, dtype=torch.float, device=device)   # create on correct device
+        h = torch.zeros(topk, dtype=torch.float, device=device)
         h[:num_pos] = 1
         return DCG(h, topk, device)
 
     device  = grd.device
-    IDCGs   = torch.zeros(1 + topk, dtype=torch.float, device=device)   # create on correct device
+    IDCGs   = torch.zeros(1 + topk, dtype=torch.float, device=device)
     IDCGs[0] = 1.0
     for i in range(1, topk + 1):
         IDCGs[i] = IDCG(i, topk, device)

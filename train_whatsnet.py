@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_dss.py  —  Training script for the DSS model.
-
-Follows the MultiCBR train.py structure with these additions:
-  - BPR loss + optional Contrastive loss (c_lambda=0 disables)
-  - Recall@20,40 / NDCG@20,40 evaluation
-  - Best model saved when BOTH Recall@20 AND NDCG@20 improve
-  - Group-wise analysis (Organic vs Contextual) at test time
-  - Score contribution analysis (S_base / S_syn / S_cont) at test time
+train_whatsnet.py  —  Training script explicitly for the DSS_whatsnet model.
 """
 
 import os
@@ -24,36 +17,24 @@ import torch
 import torch.optim as optim
 
 from utility import DSSDatasets
-from models.DSS import DSS
-
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+from models.DSS_whatsnet import DSS as DSS_whatsnet_model
 
 def get_cmd():
     parser = argparse.ArgumentParser()
     parser.add_argument("-g", "--gpu",     default="0",      type=str)
     parser.add_argument("-d", "--dataset", default="NetEase_DSS", type=str)
-    parser.add_argument("-m", "--model",   default="DSS",    type=str)
+    parser.add_argument("-m", "--model",   default="DSS_whatsnet", type=str)
     parser.add_argument("-i", "--info",    default="",       type=str)
     return parser.parse_args()
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main():
     conf = yaml.safe_load(open("./config.yaml"))
-    print("load config file done!")
-
+    
     paras        = get_cmd().__dict__
     dataset_name = paras["dataset"]
 
-    assert paras["model"] == "DSS", "Use -m DSS for train_dss.py"
+    assert paras["model"] == "DSS_whatsnet", "Use -m DSS_whatsnet for train_whatsnet.py"
 
-    # Support "NetEase_DSS" → look up key "NetEase_DSS" in config
     key = dataset_name
     assert key in conf, f"Key '{key}' not found in config.yaml"
     conf         = conf[key]
@@ -71,7 +52,6 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = conf["gpu"]
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     conf["device"] = device
-    print(conf)
 
     for lr, l2_reg, UB_ratio, UI_ratio, BI_ratio, emb_size, num_layers, c_lambda, c_temp in \
             product(conf["lrs"], conf["l2_regs"],
@@ -89,9 +69,9 @@ def main():
 
         conf["l2_reg"]       = l2_reg
         conf["embedding_size"] = emb_size
-        conf["UB_ratio"]     = UB_ratio
-        conf["UI_ratio"]     = UI_ratio
-        conf["BI_ratio"]     = BI_ratio
+        conf["UB_ratio"]     = float(UB_ratio)
+        conf["UI_ratio"]     = float(UI_ratio)
+        conf["BI_ratio"]     = float(BI_ratio)
         conf["num_layers"]   = num_layers
         conf["c_lambda"]     = c_lambda
         conf["c_temp"]       = c_temp
@@ -114,10 +94,8 @@ def main():
 
         run = SummaryWriter(run_path)
 
-        # Model
-        model = DSS(conf, dataset.graphs, dataset.bundle_info).to(device)
-        
-        # Disable Adam weight decay because BPR model computes it manually
+        # Instantiate DSS_whatsnet Model
+        model = DSS_whatsnet_model(conf, dataset.graphs, dataset.bundle_info).to(device)
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
 
         batch_cnt        = len(dataset.train_loader)
@@ -142,7 +120,6 @@ def main():
                            (batch_anchor + 1) % ed_interval_bs == 0)
 
                 bpr_loss, c_loss, reg_loss = model(batch, ED_drop=ED_drop)
-                
                 loss = bpr_loss + c_lambda * c_loss + l2_reg * reg_loss
                 
                 loss.backward()
@@ -167,22 +144,12 @@ def main():
                         checkpoint_model_path, checkpoint_conf_path,
                         epoch, batch_anchor, best_metrics, best_perform, best_epoch)
 
-        # ------------------------------------------------------------------
-        # Final best-model evaluation (optional, just to confirm loading)
-        # ------------------------------------------------------------------
         print("\n" + "=" * 60)
         print("Training finished.")
         if os.path.isfile(checkpoint_model_path):
             model.load_state_dict(torch.load(checkpoint_model_path, map_location=device))
-            print(f"Loaded best model from {checkpoint_model_path}")
         print("=" * 60 + "\n")
-
         run.close()
-
-
-# ---------------------------------------------------------------------------
-# Metric initialisation
-# ---------------------------------------------------------------------------
 
 def init_best_metrics(conf):
     best_metrics = {
@@ -194,11 +161,6 @@ def init_best_metrics(conf):
             for k in conf["topk"]:
                 best_metrics[split][m][k] = 0.0
     return best_metrics, {"val": {}, "test": {}}
-
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 
 def write_log(run, log_path, topk, step, metrics):
     curr_time  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -214,9 +176,6 @@ def write_log(run, log_path, topk, step, metrics):
     with open(log_path, "a") as f:
         f.write(val_str + "\n")
         f.write(tst_str + "\n")
-    print(val_str)
-    print(tst_str)
-
 
 def log_metrics(conf, model, metrics, run, log_path,
                 ckpt_model, ckpt_conf, epoch, step,
@@ -225,7 +184,6 @@ def log_metrics(conf, model, metrics, run, log_path,
         write_log(run, log_path, topk, step, metrics)
 
     topk_ = 20
-    print("top%d as the final evaluation standard" % topk_)
     improved_recall = metrics["val"]["recall"][topk_] > best_metrics["val"]["recall"][topk_]
     improved_ndcg   = metrics["val"]["ndcg"][topk_]   > best_metrics["val"]["ndcg"][topk_]
 
@@ -249,19 +207,12 @@ def log_metrics(conf, model, metrics, run, log_path,
                 % (curr_time, best_epoch, topk,
                    best_metrics["val"]["recall"][topk],
                    best_metrics["val"]["ndcg"][topk]))
-            print(best_perform["val"][topk])
-            print(best_perform["test"][topk])
         with open(log_path, "a") as f:
             for topk in conf["topk"]:
                 f.write(best_perform["val"][topk]  + "\n")
                 f.write(best_perform["test"][topk] + "\n")
 
     return best_metrics, best_perform, best_epoch
-
-
-# ---------------------------------------------------------------------------
-# Standard test (Recall / NDCG)
-# ---------------------------------------------------------------------------
 
 def test(model, dataloader, conf):
     tmp = {m: {k: [0, 0] for k in conf["topk"]} for m in ["recall", "ndcg"]}
@@ -275,13 +226,8 @@ def test(model, dataloader, conf):
             tmp  = get_metrics(tmp, grd, pred, conf["topk"])
     return {m: {k: tmp[m][k][0] / tmp[m][k][1] for k in conf["topk"]} for m in tmp}
 
-
-# ---------------------------------------------------------------------------
-# Metric helpers
-# ---------------------------------------------------------------------------
-
 def get_metrics(metrics, grd, pred, topks):
-    grd = grd.to(pred.device)   # ensure same device as pred (which may be on GPU)
+    grd = grd.to(pred.device)
     for topk in topks:
         _, cols = torch.topk(pred, topk)
         rows    = (torch.zeros_like(cols) +
@@ -291,10 +237,8 @@ def get_metrics(metrics, grd, pred, topks):
         metrics["ndcg"][topk]   = _acc(metrics["ndcg"][topk],   get_ndcg(pred, grd, is_hit, topk))
     return metrics
 
-
 def _acc(storage, result):
     return [storage[0] + result[0], storage[1] + result[1]]
-
 
 def get_recall(pred, grd, is_hit, topk):
     hit_cnt = is_hit.sum(dim=1)
@@ -303,18 +247,17 @@ def get_recall(pred, grd, is_hit, topk):
     nomina  = (hit_cnt / (num_pos + 1e-8)).sum().item()
     return [nomina, denorm]
 
-
 def get_ndcg(pred, grd, is_hit, topk):
     def DCG(hit, topk, device):
         return (hit / torch.log2(torch.arange(2, topk + 2, device=device, dtype=torch.float))).sum(-1)
 
     def IDCG(num_pos, topk, device):
-        h = torch.zeros(topk, dtype=torch.float, device=device)   # create on correct device
+        h = torch.zeros(topk, dtype=torch.float, device=device)
         h[:num_pos] = 1
         return DCG(h, topk, device)
 
     device  = grd.device
-    IDCGs   = torch.zeros(1 + topk, dtype=torch.float, device=device)   # create on correct device
+    IDCGs   = torch.zeros(1 + topk, dtype=torch.float, device=device)
     IDCGs[0] = 1.0
     for i in range(1, topk + 1):
         IDCGs[i] = IDCG(i, topk, device)
@@ -326,9 +269,6 @@ def get_ndcg(pred, grd, is_hit, topk):
 
     denorm  = pred.shape[0] - (num_pos == 0).sum().item()
     return [ndcg.sum().item(), denorm]
-
-
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
