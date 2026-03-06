@@ -10,7 +10,7 @@ Score(u, b) = s_base(u,b) + λ * s_new(u,b)
   Bidirectional layers (L rounds):
     Init:
       X_i^(0) = LN(W_ui·UI_i + W_bi·BI_i)          # item state
-      H_b^(0) = LN(W_biB·BI_b)                       # bundle state
+      H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)         # bundle state (BI + UB)
 
     Each layer l:
       (A) Item→Bundle:   Z_{i,b} = X_i^(l-1) + W_pe·PE(i,b)
@@ -199,9 +199,10 @@ class DSS(nn.Module):
         self.ln_item_init = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
-        # §1.2 Bundle initial state: H_b^(0) = LN(W_biB·BI_b)
+        # §1.2 Bundle initial state: H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)
         # ------------------------------------------------------------------
         self.W_biB          = nn.Linear(d, d, bias=False)
+        self.W_ubB          = nn.Linear(d, d, bias=False)
         self.ln_bundle_init = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
@@ -390,9 +391,9 @@ class DSS(nn.Module):
         """X_i^(0) = LN(W_ui·UI_i + W_bi·BI_i)  →  [N_i, d]"""
         return self.ln_item_init(self.W_ui(UI_i) + self.W_bi(BI_i))
 
-    def _bimp_bundle_init(self, BI_b):
-        """H_b^(0) = LN(W_biB·BI_b)  →  [N_b, d]"""
-        return self.ln_bundle_init(self.W_biB(BI_b))
+    def _bimp_bundle_init(self, BI_b, UB_b):
+        """H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)  →  [N_b, d]"""
+        return self.ln_bundle_init(self.W_biB(BI_b) + self.W_ubB(UB_b))
 
     def _user_query(self, UI_u, UB_u):
         """q_u = LN(W_uiq·UI_u + W_ubq·UB_u)  →  same shape as inputs"""
@@ -711,12 +712,13 @@ class DSS(nn.Module):
         UI_i = embs["UI_items"]    # [N_i, d]
         BI_i = embs["BI_items"]    # [N_i, d]
         BI_b = embs["BI_bundles"]  # [N_b, d]
+        UB_b = embs["UB_bundles"]  # [N_b, d]
 
         # ------------------------------------------------------------------
         # Local subgraph: allocate only [V, d] and [U, d]
         # ------------------------------------------------------------------
-        X_i_init_full = self._bimp_item_init(UI_i, BI_i)  # [N_i, d]  (needed for scatter-back)
-        H_b_init_full = self._bimp_bundle_init(BI_b)       # [N_b, d]
+        X_i_init_full = self._bimp_item_init(UI_i, BI_i)       # [N_i, d]  (needed for scatter-back)
+        H_b_init_full = self._bimp_bundle_init(BI_b, UB_b)      # [N_b, d]
 
         # Local slices
         X_i_loc = X_i_init_full[items_uniq].clone()        # [V, d]

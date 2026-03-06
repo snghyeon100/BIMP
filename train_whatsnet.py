@@ -176,6 +176,8 @@ def write_log(run, log_path, topk, step, metrics):
     with open(log_path, "a") as f:
         f.write(val_str + "\n")
         f.write(tst_str + "\n")
+    print(val_str)
+    print(tst_str)
 
 def log_metrics(conf, model, metrics, run, log_path,
                 ckpt_model, ckpt_conf, epoch, step,
@@ -211,6 +213,8 @@ def log_metrics(conf, model, metrics, run, log_path,
             for topk in conf["topk"]:
                 f.write(best_perform["val"][topk]  + "\n")
                 f.write(best_perform["test"][topk] + "\n")
+                print(best_perform["val"][topk])
+                print(best_perform["test"][topk])
 
     return best_metrics, best_perform, best_epoch
 
