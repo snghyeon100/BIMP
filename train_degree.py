@@ -113,8 +113,8 @@ def main():
         # Model
         model = DSS(conf, dataset.graphs, dataset.bundle_info).to(device)
         
-        # Disable Adam weight decay because BPR model computes it manually
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+        # L2 regularization via optimizer weight_decay (수동 reg_loss 계산 불필요)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
 
         batch_cnt        = len(dataset.train_loader)
         test_interval_bs = int(batch_cnt * conf["test_interval"])
@@ -127,29 +127,65 @@ def main():
             epoch_anchor = epoch * batch_cnt
             model.train(True)
             pbar = tqdm(enumerate(dataset.train_loader), total=batch_cnt)
-
             for batch_i, batch in pbar:
                 model.train(True)
                 optimizer.zero_grad()
                 batch = [x.to(device) for x in batch]
                 batch_anchor = epoch_anchor + batch_i
 
-                embs              = model.get_embeddings()
-                bpr_loss, c_loss, reg_loss = model.get_loss(embs, batch[0], batch[1])
-                
-                loss = bpr_loss + c_lambda * c_loss + l2_reg * reg_loss
+                # ------------------------------------------------------------------
+                # 타이밍 측정 (첫 epoch만, 10 batch마다 출력)
+                # ------------------------------------------------------------------
+                _profile = (epoch == 0)
+                if _profile:
+                    import time
+                    torch.cuda.synchronize()
+                    _t0 = time.perf_counter()
 
+                embs = model.get_embeddings()
+
+                if _profile:
+                    torch.cuda.synchronize()
+                    _t_emb = time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+
+                bpr_loss, c_loss, _ = model.get_loss(embs, batch[0], batch[1])
+
+                if _profile:
+                    torch.cuda.synchronize()
+                    _t_loss = time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+
+                loss = bpr_loss + c_lambda * c_loss
                 loss.backward()
+
+                if _profile:
+                    torch.cuda.synchronize()
+                    _t_bwd = time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+
                 optimizer.step()
+
+                if _profile:
+                    torch.cuda.synchronize()
+                    _t_opt = time.perf_counter() - _t0
+                    if batch_i % 10 == 0:
+                        total = _t_emb + _t_loss + _t_bwd + _t_opt
+                        print(f"\n[Timing] batch {batch_i:03d} | "
+                              f"get_emb={_t_emb*1000:.1f}ms  "
+                              f"get_loss={_t_loss*1000:.1f}ms  "
+                              f"backward={_t_bwd*1000:.1f}ms  "
+                              f"optim={_t_opt*1000:.1f}ms  "
+                              f"total={total*1000:.1f}ms")
 
                 run.add_scalar("loss_bpr", bpr_loss.detach(), batch_anchor)
                 run.add_scalar("loss_c",   c_loss.detach(),   batch_anchor)
-                run.add_scalar("loss_reg", (l2_reg * reg_loss).detach(), batch_anchor)
                 run.add_scalar("loss",     loss.detach(),     batch_anchor)
-                
+
                 pbar.set_description(
-                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f, reg: %.2e"
-                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item(), (l2_reg * reg_loss).item()))
+                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f"
+                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item()))
+
 
                 if (batch_anchor + 1) % test_interval_bs == 0:
                     metrics = {

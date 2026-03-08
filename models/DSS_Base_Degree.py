@@ -114,17 +114,14 @@ class DSS_Base(nn.Module):
             nn.init.xavier_normal_(p)
 
         # ------------------------------------------------------------------
-        # Attention signal 1: Y_UI (직접 구매 이력)
-        # [NI, NU] transposed — for user batch lookup via spmm
-        # ------------------------------------------------------------------
-        self.ui_sparse_t = _build_sparse_t(self.ui_graph, self.device)  # [NI, NU]
-
-        # ------------------------------------------------------------------
-        # Attention signal 2: Y_UB × Y_BI (번들 통한 간접 이력)
-        # [NI, NU] transposed
+        # α_u,i lookup: scipy CSR 행 선택 방식
+        # spmm + one-hot 대비 배치 크기가 작을 때 훨씬 빠름
+        # ui_csr   : Y_UI        [NU, NI]
+        # ubbi_csr : Y_UB × Y_BI [NU, NI]
         # ------------------------------------------------------------------
         A_UB_BI = self.ub_graph @ self.bi_graph
-        self.ub_bi_sparse_t = _build_sparse_t(A_UB_BI, self.device)    # [NI, NU]
+        self.ui_csr   = self.ui_graph.tocsr()  # [NU, NI] scipy CSR (CPU)
+        self.ubbi_csr = A_UB_BI.tocsr()        # [NU, NI] scipy CSR (CPU)
 
         # ------------------------------------------------------------------
         # λ: learnable balance between direct (UI) and indirect (UB-BI) signal
@@ -205,16 +202,29 @@ class DSS_Base(nn.Module):
     # ------------------------------------------------------------------
 
     def _compute_alpha(self, users_1d):
-        bs = users_1d.shape[0]
-        user_one_hot = torch.zeros((bs, self.num_users), device=self.device)
-        user_one_hot.scatter_(1, users_1d.unsqueeze(1), 1.0)
+        # 평가 시 전체 NI 콼럼: [bs, NI] 리턴
+        idx    = users_1d.cpu().numpy()
+        f_ui   = torch.from_numpy(
+            self.ui_csr[idx].toarray().astype(np.float32)
+        ).to(self.device)
+        f_ubbi = torch.from_numpy(
+            self.ubbi_csr[idx].toarray().astype(np.float32)
+        ).to(self.device)
+        lam = torch.clamp(self.lambda_ubui, min=0.0)
+        return f_ui + lam * f_ubbi   # [bs, NI]
 
-        # [NI, NU] × [NU, bs] → [NI, bs] → [bs, NI]
-        freq_ui   = torch.sparse.mm(self.ui_sparse_t,    user_one_hot.t()).t()
-        freq_ubbi = torch.sparse.mm(self.ub_bi_sparse_t, user_one_hot.t()).t()
-
-        lam = torch.clamp(self.lambda_ubui, min=0.0)  # λ ≥ 0 보장
-        return freq_ui + lam * freq_ubbi  # [bs, NI]
+    def _compute_alpha_items(self, users_1d, item_idx_np):
+        """훈련 시 사용: 지정된 아이템만 계산 → [bs, |item_idx_np|]
+        [bs, 123K] 대신 [bs, ~200] 만 생성하므로 73x 빠름."""
+        idx    = users_1d.cpu().numpy()
+        f_ui   = torch.from_numpy(
+            self.ui_csr[idx][:, item_idx_np].toarray().astype(np.float32)
+        ).to(self.device)    # [bs, n_unique]
+        f_ubbi = torch.from_numpy(
+            self.ubbi_csr[idx][:, item_idx_np].toarray().astype(np.float32)
+        ).to(self.device)    # [bs, n_unique]
+        lam = torch.clamp(self.lambda_ubui, min=0.0)
+        return f_ui + lam * f_ubbi   # [bs, n_unique]
 
     # ------------------------------------------------------------------
     # Embedding extraction
@@ -259,8 +269,13 @@ class DSS_Base(nn.Module):
         UI_i = embs["UI_items"]             # [NI, d]
         UB_b = embs["UB_bundles"]           # [NB, d]
 
-        # α_u,i: [bs, NI]  — compute once for all bundles
-        alpha_all = self._compute_alpha(users_1d)
+        # --- 배치 번들에 필요한 유니크 아이템만 수집 ---
+        all_items = self.bundle_items[flat_b].clamp(min=0)   # [bs*n_b, n_t]
+        unique_np = np.unique(all_items.cpu().numpy().ravel())  # sorted
+        unique_t  = torch.from_numpy(unique_np).long().to(self.device)
+
+        # alpha 를 유니크 아이템만 계산: [bs, n_unique] (약 ~200)
+        alpha_cmp = self._compute_alpha_items(users_1d, unique_np)  # [bs, n_unique]
 
         all_scores = []
         for j in range(n_b):
@@ -268,24 +283,22 @@ class DSS_Base(nn.Module):
             items_j = self.bundle_items[b_j].clamp(min=0)         # [bs, n_t]
             mask_j  = (self.bundle_items[b_j] >= 0)               # [bs, n_t]
 
-            # --- personalized attention weights ---
-            alpha_j = alpha_all.gather(1, items_j)                # [bs, n_t]
-            alpha_j_raw = alpha_j.masked_fill(~mask_j, 0.0)       # [bs, n_t] (0 for pad)
+            # unique_t 에서 items_j의 위치 찾기 (sorted → searchsorted)
+            pos_j = torch.searchsorted(unique_t, items_j.reshape(-1)).reshape(bs, -1)  # [bs, n_t]
+            alpha_j     = alpha_cmp.gather(1, pos_j)              # [bs, n_t]
+            alpha_j_raw = alpha_j.masked_fill(~mask_j, 0.0)
             alpha_j_soft = alpha_j.masked_fill(~mask_j, -1e9)
             w_j     = torch.softmax(alpha_j_soft, dim=-1)         # [bs, n_t]
 
-            # --- personalized bundle vector ---
-            iembs_j = UI_i[items_j]                               # [bs, n_t, d]
-            v_star_j = (w_j.unsqueeze(-1) * iembs_j).sum(dim=1)  # [bs, d]
+            iembs_j  = UI_i[items_j]                               # [bs, n_t, d]
+            v_star_j = (w_j.unsqueeze(-1) * iembs_j).sum(dim=1)   # [bs, d]
 
-            # --- score-level bonus: γ · log1p(mean α over valid items) ---
-            n_valid_j = mask_j.float().sum(dim=-1).clamp(min=1)   # [bs]
-            mean_alpha_j = alpha_j_raw.sum(dim=-1) / n_valid_j    # [bs]
-            bonus_j = self.gamma_bonus * torch.log1p(mean_alpha_j)  # [bs]
+            n_valid_j    = mask_j.float().sum(dim=-1).clamp(min=1)
+            mean_alpha_j = alpha_j_raw.sum(dim=-1) / n_valid_j
+            bonus_j      = self.gamma_bonus * torch.log1p(mean_alpha_j)
 
-            # --- final score ---
-            ub_b_j  = UB_b[b_j]                                   # [bs, d]
-            score_j = (UI_u * v_star_j).sum(-1) + (UB_u * ub_b_j).sum(-1) + bonus_j  # [bs]
+            ub_b_j  = UB_b[b_j]
+            score_j = (UI_u * v_star_j).sum(-1) + (UB_u * ub_b_j).sum(-1) + bonus_j
             all_scores.append(score_j)
 
         return torch.stack(all_scores, dim=1)  # [bs, n_b]
@@ -377,30 +390,35 @@ class DSS_Base(nn.Module):
         # α_u,i: [bs, NI] — compute once
         alpha_all = self._compute_alpha(users)
 
-        # UI part: loop over bundles (avoids [bs, NB, n_t] 3D tensor altogether)
-        il_scores = []
-        bonus_scores = []
-        for b_idx in range(NB):
-            items_b = self.bundle_items[[b_idx]].expand(users.shape[0], -1).clamp(min=0)  # [bs, n_t]
-            mask_b  = (self.bundle_items[[b_idx]].expand(users.shape[0], -1) >= 0)        # [bs, n_t]
+        # 번들 루프 → chunk 벡터화 (22864 → ~90회 루프)
+        CHUNK        = 256
+        bs           = users.shape[0]
+        il_chunks    = []
+        bonus_chunks = []
 
-            alpha_b     = alpha_all.gather(1, items_b)     # [bs, n_t]
-            alpha_b_raw = alpha_b.masked_fill(~mask_b, 0.0)
-            alpha_b_soft = alpha_b.masked_fill(~mask_b, -1e9)
-            w_b          = torch.softmax(alpha_b_soft, dim=-1)   # [bs, n_t]
+        for start in range(0, NB, CHUNK):
+            end     = min(start + CHUNK, NB)
+            items_c = self.bundle_items[start:end].clamp(min=0)  # [C, T]
+            mask_c  = self.bundle_items[start:end] >= 0          # [C, T]
+            C, T    = items_c.shape
 
-            iembs_b  = UI_i[items_b]                               # [bs, n_t, d]
-            v_star_b = (w_b.unsqueeze(-1) * iembs_b).sum(dim=1)   # [bs, d]
+            # α gather: [bs, NI] → [bs, C, T]
+            alpha_c      = alpha_all[:, items_c.view(-1)].view(bs, C, T)
+            alpha_c_raw  = alpha_c * mask_c.unsqueeze(0)
+            alpha_c_soft = alpha_c.masked_fill(~mask_c.unsqueeze(0), -1e9)
+            w = torch.softmax(alpha_c_soft, dim=-1)              # [bs, C, T]
 
-            # score-level bonus
-            n_valid_b = mask_b.float().sum(dim=-1).clamp(min=1)   # [bs]
-            mean_alpha_b = alpha_b_raw.sum(dim=-1) / n_valid_b     # [bs]
-            bonus_b = self.gamma_bonus * torch.log1p(mean_alpha_b) # [bs]
+            # item embeddings [C, T, d] — 유저 무관
+            iembs  = UI_i[items_c.view(-1)].view(C, T, d)        # [C, T, d]
+            v_star = (w.unsqueeze(-1) * iembs.unsqueeze(0)).sum(2)  # [bs, C, d]
 
-            il_scores.append((UI_u * v_star_b).sum(-1))            # [bs]
-            bonus_scores.append(bonus_b)                           # [bs]
+            il_chunks.append((UI_u.unsqueeze(1) * v_star).sum(-1))  # [bs, C]
 
-        il_score    = torch.stack(il_scores,    dim=1)  # [bs, NB]
-        bonus_total = torch.stack(bonus_scores, dim=1)  # [bs, NB]
+            n_valid    = mask_c.float().sum(-1).clamp(min=1)     # [C]
+            mean_alpha = alpha_c_raw.sum(-1) / n_valid.unsqueeze(0)  # [bs, C]
+            bonus_chunks.append(self.gamma_bonus * torch.log1p(mean_alpha))
+
+        il_score    = torch.cat(il_chunks,    dim=1)  # [bs, NB]
+        bonus_total = torch.cat(bonus_chunks, dim=1)  # [bs, NB]
 
         return il_score + ub_score + bonus_total

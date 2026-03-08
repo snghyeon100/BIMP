@@ -115,7 +115,7 @@ def main():
         # Model
         model = DSS(conf, dataset.graphs, dataset.bundle_info).to(device)
 
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
 
         batch_cnt        = len(dataset.train_loader)
         test_interval_bs = int(batch_cnt * conf["test_interval"])
@@ -135,29 +135,23 @@ def main():
                 batch = [x.to(device) for x in batch]
                 batch_anchor = epoch_anchor + batch_i
 
-                embs                         = model.get_embeddings()
-                bpr_loss, c_loss, reg_loss   = model.get_loss(embs, batch[0], batch[1])
+                embs                       = model.get_embeddings()
+                bpr_loss, c_loss, _        = model.get_loss(embs, batch[0], batch[1])
 
-                loss = bpr_loss + c_lambda * c_loss + l2_reg * reg_loss
+                loss = bpr_loss + c_lambda * c_loss
 
                 loss.backward()
                 optimizer.step()
 
-                # ------------------------------------------------------------------
-                # β 모니터링: 매 step마다 TensorBoard에 기록
-                # sigmoid(beta) = 0이면 novel 완전 우세, 1이면 familiar 완전 우세
-                # ------------------------------------------------------------------
                 beta_val = torch.sigmoid(model.beta).item()
-                run.add_scalar("loss_bpr",  bpr_loss.detach(),            batch_anchor)
-                run.add_scalar("loss_c",    c_loss.detach(),               batch_anchor)
-                run.add_scalar("loss_reg",  (l2_reg * reg_loss).detach(), batch_anchor)
-                run.add_scalar("loss",      loss.detach(),                 batch_anchor)
-                run.add_scalar("beta_familiar_weight", beta_val,           batch_anchor)
+                run.add_scalar("loss_bpr",  bpr_loss.detach(),  batch_anchor)
+                run.add_scalar("loss_c",    c_loss.detach(),    batch_anchor)
+                run.add_scalar("loss",      loss.detach(),      batch_anchor)
+                run.add_scalar("beta_familiar_weight", beta_val, batch_anchor)
 
                 pbar.set_description(
-                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f, reg: %.2e | β=%.3f"
-                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item(),
-                       (l2_reg * reg_loss).item(), beta_val))
+                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f | β=%.3f"
+                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item(), beta_val))
 
                 if (batch_anchor + 1) % test_interval_bs == 0:
                     metrics = {
