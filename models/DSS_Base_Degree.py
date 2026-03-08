@@ -120,13 +120,15 @@ class DSS_Base(nn.Module):
         # ubbi_csr : Y_UB × Y_BI [NU, NI]
         # ------------------------------------------------------------------
         A_UB_BI = self.ub_graph @ self.bi_graph
-        self.ui_csr   = self.ui_graph.tocsr()  # [NU, NI] scipy CSR (CPU)
-        self.ubbi_csr = A_UB_BI.tocsr()        # [NU, NI] scipy CSR (CPU)
-
+        
         # ------------------------------------------------------------------
-        # λ: learnable balance between direct (UI) and indirect (UB-BI) signal
+        # λ: fixed balance between direct (UI) and indirect (UB-BI) signal
         # ------------------------------------------------------------------
-        self.lambda_ubui = nn.Parameter(torch.tensor(0.5))
+        self.lambda_ubui = conf.get("lambda_ubui", 1.0)
+        
+        # Precompute α_u,i CSR matrix to save memory allocations during training
+        # alpha = ui_freq + lambda * ubbi_freq
+        self.alpha_csr = self.ui_graph.tocsr() + self.lambda_ubui * A_UB_BI.tocsr()
 
         # ------------------------------------------------------------------
         # γ: learnable weight for score-level bonus  γ · log1p(mean(α_u,b))
@@ -202,29 +204,15 @@ class DSS_Base(nn.Module):
     # ------------------------------------------------------------------
 
     def _compute_alpha(self, users_1d):
-        # 평가 시 전체 NI 콼럼: [bs, NI] 리턴
-        idx    = users_1d.cpu().numpy()
-        f_ui   = torch.from_numpy(
-            self.ui_csr[idx].toarray().astype(np.float32)
-        ).to(self.device)
-        f_ubbi = torch.from_numpy(
-            self.ubbi_csr[idx].toarray().astype(np.float32)
-        ).to(self.device)
-        lam = torch.clamp(self.lambda_ubui, min=0.0)
-        return f_ui + lam * f_ubbi   # [bs, NI]
+        idx = users_1d.cpu().numpy()
+        alpha_np = self.alpha_csr[idx].toarray().astype(np.float32)
+        return torch.from_numpy(alpha_np).to(self.device)   # [bs, NI]
 
     def _compute_alpha_items(self, users_1d, item_idx_np):
-        """훈련 시 사용: 지정된 아이템만 계산 → [bs, |item_idx_np|]
-        [bs, 123K] 대신 [bs, ~200] 만 생성하므로 73x 빠름."""
-        idx    = users_1d.cpu().numpy()
-        f_ui   = torch.from_numpy(
-            self.ui_csr[idx][:, item_idx_np].toarray().astype(np.float32)
-        ).to(self.device)    # [bs, n_unique]
-        f_ubbi = torch.from_numpy(
-            self.ubbi_csr[idx][:, item_idx_np].toarray().astype(np.float32)
-        ).to(self.device)    # [bs, n_unique]
-        lam = torch.clamp(self.lambda_ubui, min=0.0)
-        return f_ui + lam * f_ubbi   # [bs, n_unique]
+        """훈련 시: 유니크 아이템만으로 제한해 precomputed alpha에서 slice"""
+        user_np = users_1d.cpu().numpy()
+        alpha_np = self.alpha_csr[user_np].toarray().astype(np.float32)[:, item_idx_np]
+        return torch.from_numpy(alpha_np).to(self.device)  # [bs, n_item]
 
     # ------------------------------------------------------------------
     # Embedding extraction

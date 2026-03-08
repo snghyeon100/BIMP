@@ -146,6 +146,7 @@ NetEase_DSS:
   bimp_eval_single_pass: true   # single-pass BIMP at eval (O(1) vs O(NB/BC) calls)
   max_item_K_i2b: 40            # I→B token limit: top-K items per bundle (by BI+UI degree)
   lambda_weight: 1.0            # Fixed lambda weight to bypass learnable parameter
+  lambda_ubui: 1.0              # fixed parameter for DSS_Base_Degree
 
 
 iFashion_DSS:
@@ -188,6 +189,7 @@ iFashion_DSS:
   use_bimp_vb_for_stage2: true
   bimp_eval_single_pass: true
   lambda_weight: 1.0
+  lambda_ubui: 1.0
 
 Youshu_DSS:
   data_path: './datasets'
@@ -196,6 +198,7 @@ Youshu_DSS:
   topk: [20, 40]
   neg_num: 1
   lambda_weight: 0.2
+  lambda_ubui: 1.9
   core_k: 1
   aug_type: "Noise"
   ed_interval: 1

@@ -107,10 +107,16 @@ class DSS_Base(nn.Module):
 
         # α_u,i lookup: scipy CSR 행 선택 방식
         A_UB_BI = self.ub_graph @ self.bi_graph
-        self.ui_csr   = self.ui_graph.tocsr()  # [NU, NI]
-        self.ubbi_csr = A_UB_BI.tocsr()        # [NU, NI]
+        
+        # ------------------------------------------------------------------
+        # λ: fixed balance between direct (UI) and indirect (UB-BI) signal
+        # ------------------------------------------------------------------
+        self.lambda_ubui = conf.get("lambda_ubui", 1.0)
+        
+        # Precompute α_u,i CSR matrix to save memory allocations during training
+        # alpha = ui_freq + lambda * ubbi_freq
+        self.alpha_csr = self.ui_graph.tocsr() + self.lambda_ubui * A_UB_BI.tocsr()
 
-        self.lambda_ubui = nn.Parameter(torch.tensor(0.5))
         self.gamma_bonus = nn.Parameter(torch.tensor(0.01))
 
         # ------------------------------------------------------------------
@@ -192,27 +198,15 @@ class DSS_Base(nn.Module):
     # ------------------------------------------------------------------
 
     def _compute_alpha(self, users_1d):
-        idx    = users_1d.cpu().numpy()
-        f_ui   = torch.from_numpy(
-            self.ui_csr[idx].toarray().astype(np.float32)
-        ).to(self.device)
-        f_ubbi = torch.from_numpy(
-            self.ubbi_csr[idx].toarray().astype(np.float32)
-        ).to(self.device)
-        lam = torch.clamp(self.lambda_ubui, min=0.0)
-        return f_ui + lam * f_ubbi   # [bs, NI]
+        idx = users_1d.cpu().numpy()
+        alpha_np = self.alpha_csr[idx].toarray().astype(np.float32)
+        return torch.from_numpy(alpha_np).to(self.device)   # [bs, NI]
 
     def _compute_alpha_items(self, users_1d, item_idx_np):
-        """훈련 시: 지정 아이템만 계산 → [bs, n_unique]"""
-        idx    = users_1d.cpu().numpy()
-        f_ui   = torch.from_numpy(
-            self.ui_csr[idx][:, item_idx_np].toarray().astype(np.float32)
-        ).to(self.device)
-        f_ubbi = torch.from_numpy(
-            self.ubbi_csr[idx][:, item_idx_np].toarray().astype(np.float32)
-        ).to(self.device)
-        lam = torch.clamp(self.lambda_ubui, min=0.0)
-        return f_ui + lam * f_ubbi   # [bs, n_unique]
+        """훈련 시: 유니크 아이템만으로 제한해 precomputed alpha에서 slice"""
+        user_np = users_1d.cpu().numpy()
+        alpha_np = self.alpha_csr[user_np].toarray().astype(np.float32)[:, item_idx_np]
+        return torch.from_numpy(alpha_np).to(self.device)  # [bs, n_item]
 
     # ------------------------------------------------------------------
     # Embeddings
