@@ -259,28 +259,18 @@ class DSS_Base(nn.Module):
         scores = self.compute_scores(embs, users, bundles)
         pos  = scores[:, 0]
         negs = scores[:, 1:]
-        bpr  = sum(F.softplus(negs[:, i] - pos).mean()
-                   for i in range(negs.shape[1])) / negs.shape[1]
+        
+        # 벡터화된 BPR loss (파이썬 for loop 제거)
+        bpr  = F.softplus(negs - pos.unsqueeze(1)).mean()
+        
         if self.conf.get("c_lambda", 0.0) > 0:
             pos_bundles = bundles[:, 0]
             c_loss = self.cal_c_loss(embs, users.view(-1), pos_bundles)
         else:
             c_loss = torch.tensor(0.0, device=self.device)
             
-        # BPR Regularization Loss
-        bs = users.shape[0]
-        bundles_flat = bundles.view(-1)
-        u_emb_0 = self.users_feature[users]
-        b_emb_0 = self.bundles_feature[bundles_flat]
-        
-        safe_items = self.bundle_items[bundles_flat].clamp(min=0)
-        i_emb_0 = self.items_feature[safe_items]
-        valid_mask = (self.bundle_items[bundles_flat] >= 0).float()
-        i_emb_0 = i_emb_0 * valid_mask.unsqueeze(-1)
-        
-        reg_loss = (1/2)*(u_emb_0.norm(2).pow(2) + 
-                          b_emb_0.norm(2).pow(2) + 
-                          i_emb_0.norm(2).pow(2)) / float(bs)
+        # L2 reg는 optimizer weight_decay에서 처리되므로 여기에서는 0 반환 (backward 병목 제거)
+        reg_loss = torch.tensor(0.0, device=self.device)
                           
         return bpr, c_loss, reg_loss
 

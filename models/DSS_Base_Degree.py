@@ -126,18 +126,24 @@ class DSS_Base(nn.Module):
         # ------------------------------------------------------------------
         self.lambda_ubui = conf.get("lambda_ubui", 1.0)
         
-        # Precompute α_u,i CSR matrix to save memory allocations during training
-        # alpha = ui_freq + lambda * ubbi_freq
-        self.alpha_csr = self.ui_graph.tocsr() + self.lambda_ubui * A_UB_BI.tocsr()
-
         # ------------------------------------------------------------------
         # γ: learnable weight for score-level bonus  γ · log1p(mean(α_u,b))
         # 번들 내 유저 친밀도 총합을 스코어에 직접 가산
         # ------------------------------------------------------------------
         self.gamma_bonus = nn.Parameter(torch.tensor(0.01))
 
-        # Build propagation graphs
+        # Build propagation graphs FIRST (before putting alpha on GPU)
         self._build_graphs()
+
+        # Precompute α_u,i CSR matrix
+        # alpha = ui_freq + lambda * ubbi_freq
+        alpha_csr = self.ui_graph.tocsr() + self.lambda_ubui * A_UB_BI.tocsr()
+        alpha_coo = alpha_csr.tocoo()
+        i = torch.LongTensor([alpha_coo.row, alpha_coo.col])
+        v = torch.FloatTensor(alpha_coo.data)
+        self.alpha_pt = torch.sparse_coo_tensor(
+            i, v, torch.Size(alpha_coo.shape)
+        ).to(self.device).coalesce()
 
     # ------------------------------------------------------------------
     # Graph building
@@ -203,16 +209,18 @@ class DSS_Base(nn.Module):
     # Returns: [bs, NI]  (dense, from sparse mm)
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def _compute_alpha(self, users_1d):
-        idx = users_1d.cpu().numpy()
-        alpha_np = self.alpha_csr[idx].toarray().astype(np.float32)
-        return torch.from_numpy(alpha_np).to(self.device)   # [bs, NI]
+        # 파이토치 sparse GPU 텐서에서 users_1d 추출 후 dense 변환
+        alpha_sparse = self.alpha_pt.index_select(0, users_1d)
+        return alpha_sparse.to_dense()   # [bs, NI]
 
-    def _compute_alpha_items(self, users_1d, item_idx_np):
-        """훈련 시: 유니크 아이템만으로 제한해 precomputed alpha에서 slice"""
-        user_np = users_1d.cpu().numpy()
-        alpha_np = self.alpha_csr[user_np].toarray().astype(np.float32)[:, item_idx_np]
-        return torch.from_numpy(alpha_np).to(self.device)  # [bs, n_item]
+    @torch.no_grad()
+    def _compute_alpha_items(self, users_1d, item_idx_t):
+        """GPU 내에서 sparse tensor 슬라이싱으로 즉시 추출"""
+        alpha_sparse = self.alpha_pt.index_select(0, users_1d) # [bs, NI]
+        alpha_dense  = alpha_sparse.to_dense()                 # [bs, NI]
+        return alpha_dense.index_select(1, item_idx_t)         # [bs, n_item]
 
     # ------------------------------------------------------------------
     # Embedding extraction
@@ -248,7 +256,6 @@ class DSS_Base(nn.Module):
 
     def compute_scores(self, embs, users, bundles):
         bs, n_b = bundles.shape
-        flat_b  = bundles.reshape(-1)   # [bs * n_b]
         d       = self.emb_size
 
         users_1d = users.view(-1)       # [bs]
@@ -257,39 +264,55 @@ class DSS_Base(nn.Module):
         UI_i = embs["UI_items"]             # [NI, d]
         UB_b = embs["UB_bundles"]           # [NB, d]
 
-        # --- 배치 번들에 필요한 유니크 아이템만 수집 ---
-        all_items = self.bundle_items[flat_b].clamp(min=0)   # [bs*n_b, n_t]
-        unique_np = np.unique(all_items.cpu().numpy().ravel())  # sorted
-        unique_t  = torch.from_numpy(unique_np).long().to(self.device)
+        # --- 배치 전체 번들 아이템 처리 (Vectorized) ---
+        items_all = self.bundle_items[bundles].clamp(min=0)  # [bs, n_b, n_t]
+        n_t       = items_all.shape[-1]                      # 아이템 최대 개수
+        mask_all  = (self.bundle_items[bundles] >= 0)        # [bs, n_b, n_t]
+        
+        flat_items = items_all.reshape(-1) # [bs * n_b * n_t]
+        unique_t, inv_idx = torch.unique(flat_items, return_inverse=True)
 
-        # alpha 를 유니크 아이템만 계산: [bs, n_unique] (약 ~200)
-        alpha_cmp = self._compute_alpha_items(users_1d, unique_np)  # [bs, n_unique]
+        # alpha 계산: [bs, n_unique]
+        alpha_cmp = self._compute_alpha_items(users_1d, unique_t)  # [bs, n_unique]
 
-        all_scores = []
-        for j in range(n_b):
-            b_j     = flat_b[j::n_b]                              # [bs]
-            items_j = self.bundle_items[b_j].clamp(min=0)         # [bs, n_t]
-            mask_j  = (self.bundle_items[b_j] >= 0)               # [bs, n_t]
+        # inv_idx 이용해서 alpha_all 매핑: [bs * n_b * n_t] -> [bs, n_b, n_t]
+        # inv_idx_reshaped = inv_idx.reshape(bs, n_b, n_t)  # shape mismatch.
+        # 주의: alpha_cmp는 [bs, n_unique] 이고 각 element는 유저마다 다름.
+        pos_all = inv_idx.reshape(bs, n_b, n_t)  # [bs, n_b, n_t]
+        
+        # [bs, n_b, n_t] 텐서를 flatten해서 alpha_cmp.gather에 써야함.
+        # alpha_cmp: [bs, n_unique]. pos_all: [bs, n_b, n_t].
+        # dim=1 이므로 n_b*n_t 로 합쳐서 gather
+        alpha_all = alpha_cmp.gather(1, pos_all.view(bs, -1)).view(bs, n_b, n_t)
+        
+        alpha_all_raw = alpha_all.masked_fill(~mask_all, 0.0)
+        
+        # softmax 계산: [bs, n_b, n_t]
+        w_all = torch.softmax(alpha_all.masked_fill(~mask_all, -1e9), dim=-1)
 
-            # unique_t 에서 items_j의 위치 찾기 (sorted → searchsorted)
-            pos_j = torch.searchsorted(unique_t, items_j.reshape(-1)).reshape(bs, -1)  # [bs, n_t]
-            alpha_j     = alpha_cmp.gather(1, pos_j)              # [bs, n_t]
-            alpha_j_raw = alpha_j.masked_fill(~mask_j, 0.0)
-            alpha_j_soft = alpha_j.masked_fill(~mask_j, -1e9)
-            w_j     = torch.softmax(alpha_j_soft, dim=-1)         # [bs, n_t]
+        # 아이템 임베딩: unique에서만 조회 (backward: 200개 scatter 대신 sgemm)
+        n_unique = unique_t.shape[0]
+        unique_iembs = UI_i[unique_t]                              # [n_unique, d]
 
-            iembs_j  = UI_i[items_j]                               # [bs, n_t, d]
-            v_star_j = (w_j.unsqueeze(-1) * iembs_j).sum(dim=1)   # [bs, d]
+        # w를 unique 공간에서 집계: [bs, n_b, n_unique]
+        w_unique = torch.zeros(bs, n_b, n_unique, device=self.device)
+        w_unique.scatter_add_(2, inv_idx.view(bs, n_b, n_t), w_all)
 
-            n_valid_j    = mask_j.float().sum(dim=-1).clamp(min=1)
-            mean_alpha_j = alpha_j_raw.sum(dim=-1) / n_valid_j
-            bonus_j      = self.gamma_bonus * torch.log1p(mean_alpha_j)
+        # v_star: [bs, n_b, d]  (backward: w_unique.T @ grad_v_star = sgemm ✔)
+        v_star_all = w_unique @ unique_iembs                       # [bs, n_b, d]
 
-            ub_b_j  = UB_b[b_j]
-            score_j = (UI_u * v_star_j).sum(-1) + (UB_u * ub_b_j).sum(-1) + bonus_j
-            all_scores.append(score_j)
+        # bonus 계산: [bs, n_b]
+        n_valid_all = mask_all.float().sum(dim=-1).clamp(min=1)
+        mean_alpha_all = alpha_all_raw.sum(dim=-1) / n_valid_all
+        bonus_all = self.gamma_bonus * torch.log1p(mean_alpha_all)
 
-        return torch.stack(all_scores, dim=1)  # [bs, n_b]
+        # score 계산: [bs, n_b]
+        ub_b_all = UB_b[bundles] # [bs, n_b, d]
+        
+        # (bs, 1, d) * (bs, n_b, d) -> sum(-1) -> (bs, n_b)
+        score_all = (UI_u.unsqueeze(1) * v_star_all).sum(-1) + (UB_u.unsqueeze(1) * ub_b_all).sum(-1) + bonus_all
+
+        return score_all  # [bs, n_b]
 
     # ------------------------------------------------------------------
     # Contrastive Loss
@@ -323,28 +346,17 @@ class DSS_Base(nn.Module):
         scores = self.compute_scores(embs, users, bundles)
         pos  = scores[:, 0]
         negs = scores[:, 1:]
-        bpr  = sum(F.softplus(negs[:, i] - pos).mean()
-                for i in range(negs.shape[1])) / negs.shape[1]
+        # 벡터화된 BPR loss (파이썬 for loop 제거)
+        bpr  = F.softplus(negs - pos.unsqueeze(1)).mean()
+
         if self.conf.get("c_lambda", 0.0) > 0:
             pos_bundles = bundles[:, 0]
             c_loss = self.cal_c_loss(embs, users.view(-1), pos_bundles)
         else:
             c_loss = torch.tensor(0.0, device=self.device)
 
-        # L2 Regularization
-        bs = users.shape[0]
-        bundles_flat = bundles.view(-1)
-        u_emb_0 = self.users_feature[users.view(-1)]
-        b_emb_0 = self.bundles_feature[bundles_flat]
-
-        safe_items = self.bundle_items[bundles_flat].clamp(min=0)
-        i_emb_0 = self.items_feature[safe_items]
-        valid_mask = (self.bundle_items[bundles_flat] >= 0).float()
-        i_emb_0 = i_emb_0 * valid_mask.unsqueeze(-1)
-
-        reg_loss = (1/2) * (u_emb_0.norm(2).pow(2) +
-                            b_emb_0.norm(2).pow(2) +
-                            i_emb_0.norm(2).pow(2)) / float(bs)
+        # L2 reg는 optimizer weight_decay에서 처리되므로 여기에서는 0 반환
+        reg_loss = torch.tensor(0.0, device=self.device)
 
         return bpr, c_loss, reg_loss
 

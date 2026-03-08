@@ -1,0 +1,7 @@
+﻿
+InputObject        SideIndicator
+-----------        -------------
+DSS_Base_Degree.py =>           
+DSS_Base.py        <=           
+
+
