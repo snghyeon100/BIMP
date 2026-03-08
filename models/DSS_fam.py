@@ -137,6 +137,15 @@ class DSS_Base(nn.Module):
         # ------------------------------------------------------------------
         self.gamma_bonus = nn.Parameter(torch.tensor(0.01))
 
+        # ------------------------------------------------------------------
+        # Stage 1: Familiar/Novel Dual-Head Pooling
+        #   v_trust  = softmax(+α) · e_i  (아는 아이템 집중)
+        #   v_motive = softmax(−α) · e_i  (모르는 아이템 집중)
+        #   v*_u,b   = β · v_trust + (1−β) · v_motive
+        # β는 global learnable 스칼라 (Stage 2에서 유저별로 개인화 예정)
+        # ------------------------------------------------------------------
+        self.beta = nn.Parameter(torch.tensor(0.5))   # β ∈ [0,1] via sigmoid
+
         # Build propagation graphs
         self._build_graphs()
 
@@ -262,30 +271,39 @@ class DSS_Base(nn.Module):
         # α_u,i: [bs, NI]  — compute once for all bundles
         alpha_all = self._compute_alpha(users_1d)
 
+        beta = torch.sigmoid(self.beta)   # β ∈ (0, 1)
+
         all_scores = []
         for j in range(n_b):
             b_j     = flat_b[j::n_b]                              # [bs]
             items_j = self.bundle_items[b_j].clamp(min=0)         # [bs, n_t]
             mask_j  = (self.bundle_items[b_j] >= 0)               # [bs, n_t]
 
-            # --- personalized attention weights ---
-            alpha_j = alpha_all.gather(1, items_j)                # [bs, n_t]
-            alpha_j_raw = alpha_j.masked_fill(~mask_j, 0.0)       # [bs, n_t] (0 for pad)
-            alpha_j_soft = alpha_j.masked_fill(~mask_j, -1e9)
-            w_j     = torch.softmax(alpha_j_soft, dim=-1)         # [bs, n_t]
+            alpha_j      = alpha_all.gather(1, items_j)           # [bs, n_t]
+            alpha_j_raw  = alpha_j.masked_fill(~mask_j, 0.0)
+            pad_mask_inf = ~mask_j
 
-            # --- personalized bundle vector ---
-            iembs_j = UI_i[items_j]                               # [bs, n_t, d]
-            v_star_j = (w_j.unsqueeze(-1) * iembs_j).sum(dim=1)  # [bs, d]
+            # --- Familiar head: softmax(+α) → 아는 아이템 집중 ---
+            w_fam_j  = torch.softmax(alpha_j.masked_fill(pad_mask_inf, -1e9), dim=-1)   # [bs, n_t]
+
+            # --- Novel head: softmax(−α) → 모르는 아이템 집중 ---
+            w_nov_j  = torch.softmax((-alpha_j).masked_fill(pad_mask_inf, -1e9), dim=-1) # [bs, n_t]
+
+            iembs_j   = UI_i[items_j]                              # [bs, n_t, d]
+            v_trust_j  = (w_fam_j.unsqueeze(-1) * iembs_j).sum(1) # [bs, d]
+            v_motive_j = (w_nov_j.unsqueeze(-1) * iembs_j).sum(1) # [bs, d]
+
+            # --- β 믹싱 ---
+            v_star_j = beta * v_trust_j + (1.0 - beta) * v_motive_j  # [bs, d]
 
             # --- score-level bonus: γ · log1p(mean α over valid items) ---
-            n_valid_j = mask_j.float().sum(dim=-1).clamp(min=1)   # [bs]
-            mean_alpha_j = alpha_j_raw.sum(dim=-1) / n_valid_j    # [bs]
-            bonus_j = self.gamma_bonus * torch.log1p(mean_alpha_j)  # [bs]
+            n_valid_j    = mask_j.float().sum(dim=-1).clamp(min=1)
+            mean_alpha_j = alpha_j_raw.sum(dim=-1) / n_valid_j
+            bonus_j      = self.gamma_bonus * torch.log1p(mean_alpha_j)  # [bs]
 
             # --- final score ---
             ub_b_j  = UB_b[b_j]                                   # [bs, d]
-            score_j = (UI_u * v_star_j).sum(-1) + (UB_u * ub_b_j).sum(-1) + bonus_j  # [bs]
+            score_j = (UI_u * v_star_j).sum(-1) + (UB_u * ub_b_j).sum(-1) + bonus_j
             all_scores.append(score_j)
 
         return torch.stack(all_scores, dim=1)  # [bs, n_b]
@@ -377,25 +395,33 @@ class DSS_Base(nn.Module):
         # α_u,i: [bs, NI] — compute once
         alpha_all = self._compute_alpha(users)
 
-        # UI part: loop over bundles (avoids [bs, NB, n_t] 3D tensor altogether)
-        il_scores = []
+        # UI part: loop over bundles
+        beta = torch.sigmoid(self.beta)   # β ∈ (0, 1)
+        il_scores    = []
         bonus_scores = []
         for b_idx in range(NB):
             items_b = self.bundle_items[[b_idx]].expand(users.shape[0], -1).clamp(min=0)  # [bs, n_t]
             mask_b  = (self.bundle_items[[b_idx]].expand(users.shape[0], -1) >= 0)        # [bs, n_t]
 
-            alpha_b     = alpha_all.gather(1, items_b)     # [bs, n_t]
-            alpha_b_raw = alpha_b.masked_fill(~mask_b, 0.0)
-            alpha_b_soft = alpha_b.masked_fill(~mask_b, -1e9)
-            w_b          = torch.softmax(alpha_b_soft, dim=-1)   # [bs, n_t]
+            alpha_b      = alpha_all.gather(1, items_b)            # [bs, n_t]
+            alpha_b_raw  = alpha_b.masked_fill(~mask_b, 0.0)
+            pad_mask_inf = ~mask_b
 
-            iembs_b  = UI_i[items_b]                               # [bs, n_t, d]
-            v_star_b = (w_b.unsqueeze(-1) * iembs_b).sum(dim=1)   # [bs, d]
+            # --- Familiar head ---
+            w_fam_b  = torch.softmax(alpha_b.masked_fill(pad_mask_inf, -1e9), dim=-1)
+            # --- Novel head ---
+            w_nov_b  = torch.softmax((-alpha_b).masked_fill(pad_mask_inf, -1e9), dim=-1)
+
+            iembs_b    = UI_i[items_b]                             # [bs, n_t, d]
+            v_trust_b  = (w_fam_b.unsqueeze(-1) * iembs_b).sum(1) # [bs, d]
+            v_motive_b = (w_nov_b.unsqueeze(-1) * iembs_b).sum(1) # [bs, d]
+
+            v_star_b = beta * v_trust_b + (1.0 - beta) * v_motive_b  # [bs, d]
 
             # score-level bonus
-            n_valid_b = mask_b.float().sum(dim=-1).clamp(min=1)   # [bs]
-            mean_alpha_b = alpha_b_raw.sum(dim=-1) / n_valid_b     # [bs]
-            bonus_b = self.gamma_bonus * torch.log1p(mean_alpha_b) # [bs]
+            n_valid_b    = mask_b.float().sum(dim=-1).clamp(min=1)
+            mean_alpha_b = alpha_b_raw.sum(dim=-1) / n_valid_b
+            bonus_b      = self.gamma_bonus * torch.log1p(mean_alpha_b)
 
             il_scores.append((UI_u * v_star_b).sum(-1))            # [bs]
             bonus_scores.append(bonus_b)                           # [bs]

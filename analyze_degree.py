@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from utility import DSSDatasets
-from models.DSS_Base import DSS_Base as DSS
+from models.DSS_Base_Degree import DSS_Base as DSS
 
 
 # ---------------------------------------------------------------------------
