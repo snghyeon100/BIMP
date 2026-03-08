@@ -340,14 +340,17 @@ class DSS_Base(nn.Module):
     # Evaluation
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
     def evaluate(self, embs, users):
         return self._score_all_bundles(embs, users)
 
+    @torch.no_grad()
     def evaluate_with_components(self, embs, users):
         scores = self._score_all_bundles(embs, users)
         zeros  = torch.zeros_like(scores)
         return scores, scores, zeros, zeros
 
+    @torch.no_grad()
     def _score_all_bundles(self, embs, users):
         users = users.squeeze()
         if users.dim() == 0:
@@ -360,44 +363,61 @@ class DSS_Base(nn.Module):
         NB   = self.num_bundles
 
         ub_score  = torch.mm(UB_u, UB_b.t())           # [bs, NB]
-        alpha_all = self._compute_alpha(users)          # [bs, NI]
 
-        # Stage 2: 유저별 β_u  [bs]
-        beta_u = self.user_beta[users]                  # [bs]
+        USER_CHUNK   = 256
+        BUNDLE_CHUNK = 256
+        bs           = users.shape[0]
 
-        # 번들 루프 → chunk 벡터화 (유저별 β_u 유지)
-        CHUNK        = 256
-        b_u          = beta_u.unsqueeze(1).unsqueeze(-1)  # [bs, 1, 1]
-        il_chunks    = []
-        bonus_chunks = []
+        all_user_scores = []
 
-        for start in range(0, NB, CHUNK):
-            end     = min(start + CHUNK, NB)
-            items_c = self.bundle_items[start:end].clamp(min=0)  # [C, T]
-            mask_c  = self.bundle_items[start:end] >= 0          # [C, T]
-            C, T    = items_c.shape
+        for u_start in range(0, bs, USER_CHUNK):
+            u_end    = min(u_start + USER_CHUNK, bs)
+            curr_users = users[u_start:u_end]
+            uc       = curr_users.shape[0]
 
-            alpha_c      = alpha_all[:, items_c.view(-1)].view(bs, C, T)  # [bs, C, T]
-            alpha_c_raw  = alpha_c * mask_c.unsqueeze(0)
-            alpha_c_soft = alpha_c.masked_fill(~mask_c.unsqueeze(0), -1e9)
+            UI_u_chunk = embs["UI_users"][curr_users]  # [uc, d]
+            UB_u_chunk = embs["UB_users"][curr_users]  # [uc, d]
+            b_u        = self.user_beta[curr_users].unsqueeze(1).unsqueeze(-1)  # [uc, 1, 1]
 
-            w_fam = torch.softmax( alpha_c_soft, dim=-1)          # [bs, C, T]
-            w_nov = torch.softmax(-alpha_c_soft, dim=-1)
+            # α_u,i: [uc, NI]
+            alpha_u = self._compute_alpha(curr_users)
 
-            iembs    = UI_i[items_c.view(-1)].view(C, T, d)       # [C, T, d]
-            v_trust  = (w_fam.unsqueeze(-1) * iembs.unsqueeze(0)).sum(2)   # [bs, C, d]
-            v_motive = (w_nov.unsqueeze(-1) * iembs.unsqueeze(0)).sum(2)
+            il_chunks    = []
+            bonus_chunks = []
 
-            # 유저별 β_u 믹싱: b_u [bs, 1, 1] broadcast
-            v_star = b_u * v_trust + (1.0 - b_u) * v_motive       # [bs, C, d]
+            for b_start in range(0, NB, BUNDLE_CHUNK):
+                b_end   = min(b_start + BUNDLE_CHUNK, NB)
+                items_c = self.bundle_items[b_start:b_end].clamp(min=0)  # [C, T]
+                mask_c  = self.bundle_items[b_start:b_end] >= 0          # [C, T]
+                C, T    = items_c.shape
 
-            il_chunks.append((UI_u.unsqueeze(1) * v_star).sum(-1)) # [bs, C]
+                # α gather: [uc, NI] → [uc, C, T]
+                alpha_c      = alpha_u[:, items_c.view(-1)].view(uc, C, T)
+                alpha_c_raw  = alpha_c * mask_c.unsqueeze(0)
+                alpha_c_soft = alpha_c.masked_fill(~mask_c.unsqueeze(0), -1e9)
 
-            n_valid    = mask_c.float().sum(-1).clamp(min=1)       # [C]
-            mean_alpha = alpha_c_raw.sum(-1) / n_valid.unsqueeze(0)
-            bonus_chunks.append(self.gamma_bonus * torch.log1p(mean_alpha))
+                w_fam = torch.softmax( alpha_c_soft, dim=-1)          # [uc, C, T]
+                w_nov = torch.softmax(-alpha_c_soft, dim=-1)
 
-        il_score    = torch.cat(il_chunks,    dim=1)  # [bs, NB]
-        bonus_total = torch.cat(bonus_chunks, dim=1)  # [bs, NB]
+                iembs    = UI_i[items_c.view(-1)].view(C, T, d)       # [C, T, d]
+                
+                # bmm (C, uc, T) @ (C, T, d) -> (C, uc, d) -> (uc, C, d)
+                v_trust  = torch.bmm(w_fam.transpose(0, 1), iembs).transpose(0, 1)
+                v_motive = torch.bmm(w_nov.transpose(0, 1), iembs).transpose(0, 1)
 
-        return il_score + ub_score + bonus_total
+                # 유저별 β_u 믹싱: b_u [uc, 1, 1] broadcast
+                v_star = b_u * v_trust + (1.0 - b_u) * v_motive       # [uc, C, d]
+
+                il_chunks.append((UI_u_chunk.unsqueeze(1) * v_star).sum(-1)) # [uc, C]
+
+                n_valid    = mask_c.float().sum(-1).clamp(min=1)       # [C]
+                mean_alpha = alpha_c_raw.sum(-1) / n_valid.unsqueeze(0)
+                bonus_chunks.append(self.gamma_bonus * torch.log1p(mean_alpha))
+
+            il_score    = torch.cat(il_chunks,    dim=1)  # [uc, NB]
+            bonus_total = torch.cat(bonus_chunks, dim=1)  # [uc, NB]
+
+            ub_score_chunk = ub_score[u_start:u_end]      # [uc, NB]
+            all_user_scores.append(il_score + ub_score_chunk + bonus_total)
+
+        return torch.cat(all_user_scores, dim=0)
