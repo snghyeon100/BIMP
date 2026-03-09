@@ -127,10 +127,8 @@ class DSS_Base(nn.Module):
         self.lambda_ubui = conf.get("lambda_ubui", 1.0)
         
         # ------------------------------------------------------------------
-        # γ: learnable weight for score-level bonus  γ · log1p(mean(α_u,b))
-        # 번들 내 유저 친밀도 총합을 스코어에 직접 가산
+        # 보너스 가산 텀 삭제 (과적합 방지, user request)
         # ------------------------------------------------------------------
-        self.gamma_bonus = nn.Parameter(torch.tensor(0.01))
 
         # Build propagation graphs FIRST (before putting alpha on GPU)
         self._build_graphs()
@@ -301,16 +299,11 @@ class DSS_Base(nn.Module):
         # v_star: [bs, n_b, d]  (backward: w_unique.T @ grad_v_star = sgemm ✔)
         v_star_all = w_unique @ unique_iembs                       # [bs, n_b, d]
 
-        # bonus 계산: [bs, n_b]
-        n_valid_all = mask_all.float().sum(dim=-1).clamp(min=1)
-        mean_alpha_all = alpha_all_raw.sum(dim=-1) / n_valid_all
-        bonus_all = self.gamma_bonus * torch.log1p(mean_alpha_all)
-
         # score 계산: [bs, n_b]
         ub_b_all = UB_b[bundles] # [bs, n_b, d]
         
         # (bs, 1, d) * (bs, n_b, d) -> sum(-1) -> (bs, n_b)
-        score_all = (UI_u.unsqueeze(1) * v_star_all).sum(-1) + (UB_u.unsqueeze(1) * ub_b_all).sum(-1) + bonus_all
+        score_all = (UI_u.unsqueeze(1) * v_star_all).sum(-1) + (UB_u.unsqueeze(1) * ub_b_all).sum(-1)
 
         return score_all  # [bs, n_b]
 
@@ -406,7 +399,6 @@ class DSS_Base(nn.Module):
             alpha_u = self._compute_alpha(curr_users)
 
             il_chunks    = []
-            bonus_chunks = []
 
             for b_start in range(0, NB, BUNDLE_CHUNK):
                 b_end   = min(b_start + BUNDLE_CHUNK, NB)
@@ -427,13 +419,8 @@ class DSS_Base(nn.Module):
 
                 il_chunks.append((UI_u.unsqueeze(1) * v_star).sum(-1))   # [uc, C]
 
-                n_valid    = mask_c.float().sum(-1).clamp(min=1)         # [C]
-                mean_alpha = alpha_c_raw.sum(-1) / n_valid.unsqueeze(0)  # [uc, C]
-                bonus_chunks.append(self.gamma_bonus * torch.log1p(mean_alpha))
-
             il_score    = torch.cat(il_chunks,    dim=1)  # [uc, NB]
-            bonus_total = torch.cat(bonus_chunks, dim=1)  # [uc, NB]
 
-            all_user_scores.append(il_score + ub_score + bonus_total)
+            all_user_scores.append(il_score + ub_score)
 
         return torch.cat(all_user_scores, dim=0)
