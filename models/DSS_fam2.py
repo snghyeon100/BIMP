@@ -399,7 +399,7 @@ class DSS_Base(nn.Module):
                 w_fam = torch.softmax( alpha_c_soft, dim=-1)          # [uc, C, T]
                 w_nov = torch.softmax(-alpha_c_soft, dim=-1)
 
-                iembs    = UI_i[items_c.view(-1)].view(C, T, d)       # [C, T, d]
+                iembs    = UI_i[items_c.view(-1)].view(C, T, -1)      # [C, T, d]
                 
                 # bmm (C, uc, T) @ (C, T, d) -> (C, uc, d) -> (uc, C, d)
                 v_trust  = torch.bmm(w_fam.transpose(0, 1), iembs).transpose(0, 1)
