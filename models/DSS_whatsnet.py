@@ -260,10 +260,10 @@ class DSS(nn.Module):
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
-        # §7 Baseline residual scalar λ = sigmoid(logit_lambda)
-        #    Init logit=-3 → λ≈0.047 (start close to baseline-only)
+        # §7 Baseline residual scalar λ
+        #    Fixed to 0.5 as requested
         # ------------------------------------------------------------------
-        self.logit_lambda = nn.Parameter(torch.tensor(-3.0))
+        self.lam_weight = 0.5
 
         # Config compatibility
         self.alpha_base = float(conf.get("alpha_base", 1.0))
@@ -565,11 +565,8 @@ class DSS(nn.Module):
     # ------------------------------------------------------------------
 
     def _get_lambda(self):
-        """Returns lam scalar. Fixed if 'lambda_weight' is in config, else learned."""
-        fixed = self.conf.get("lambda_weight", None)
-        if fixed is not None:
-            return float(fixed)
-        return torch.sigmoid(self.logit_lambda)
+        """Returns fixed lam scalar (0.5)."""
+        return self.lam_weight
 
     def _stage2_score(self, q_flat, V_b, valid):
         """
