@@ -225,7 +225,7 @@ class DSS(nn.Module):
 
         # ------------------------------------------------------------------
         # §5 Positional Encoding: W_pe: Linear(3 → d)
-        #    channels: rank_ui_deg, rank_bi_deg, rev_rank_ui_deg
+        #    channels: rank_ui_deg, rank_bi_deg, rank_ub_deg
         # ------------------------------------------------------------------
         self.W_pe = nn.Linear(3, d, bias=False)
 
@@ -307,9 +307,13 @@ class DSS(nn.Module):
         
         rk_ui = rank_norm(ui_deg, valid)
         rk_bi = rank_norm(bi_deg, valid)
-        rev_ui = (1.0 - rk_ui).masked_fill(~valid, 0.0)
         
-        pe_raw = torch.stack([rk_ui, rk_bi, rev_ui], dim=-1) # [NB, n_t, 3]
+        # Globally normalize Bundle Popularity (UB Degree) to [0.0, 1.0]
+        max_ub = self._ub_bundle_deg.max().clamp(min=1.0)
+        rk_ub  = (self._ub_bundle_deg / max_ub).unsqueeze(1).expand(NB, n_t)
+        rk_ub  = rk_ub.masked_fill(~valid, 0.0)
+        
+        pe_raw = torch.stack([rk_ui, rk_bi, rk_ub], dim=-1) # [NB, n_t, 3]
         pe_valid = pe_raw[valid] # [E, 3]
         
         self.g_i2b.edges['in'].data['pe_raw'] = pe_valid
@@ -348,6 +352,16 @@ class DSS(nn.Module):
         bi_deg = np.array(self.bi_graph.sum(axis=0)).ravel().astype(np.float32)  # [N_i]
         self._ui_item_deg = torch.tensor(ui_deg, dtype=torch.float, device=self.device)
         self._bi_item_deg = torch.tensor(bi_deg, dtype=torch.float, device=self.device)
+
+        # Bundle degree for PE
+        ub_b_deg = np.array(self.ub_graph.sum(axis=0)).ravel().astype(np.float32)  # [N_b]
+        self.register_buffer("_ub_bundle_deg", torch.tensor(ub_b_deg, dtype=torch.float, device=self.device))
+
+        # User mixing ratio (beta_u)
+        ui_u_deg = np.array(self.ui_graph.sum(axis=1)).ravel().astype(np.float32)  # [N_u]
+        ub_u_deg = np.array(self.ub_graph.sum(axis=1)).ravel().astype(np.float32)  # [N_u]
+        user_beta = ui_u_deg / (ui_u_deg + ub_u_deg + 1e-8)
+        self.register_buffer("user_beta", torch.tensor(user_beta, dtype=torch.float, device=self.device))
 
     def _refresh_ed_graphs(self):
         user_size   = self.ub_graph.sum(axis=1).A.ravel() + 1e-8
@@ -446,9 +460,10 @@ class DSS(nn.Module):
         """H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)  →  [N_b, d]"""
         return self.ln_bundle_init(self.W_biB(BI_b) + self.W_ubB(UB_b))
 
-    def _user_query(self, UI_u, UB_u):
-        """q_u = LN(W_uiq·UI_u + W_ubq·UB_u)  →  same shape as inputs"""
-        return self.ln_user_q(self.W_uiq(UI_u) + self.W_ubq(UB_u))
+    def _user_query(self, UI_u, UB_u, users_ids):
+        """q_u = LN(beta_u*W_uiq·UI_u + (1-beta_u)*W_ubq·UB_u)"""
+        bu = self.user_beta[users_ids].unsqueeze(-1)  # shape depends on users_ids
+        return self.ln_user_q(bu * self.W_uiq(UI_u) + (1.0 - bu) * self.W_ubq(UB_u))
 
     # ------------------------------------------------------------------
     # §5  Positional Encoding
@@ -638,7 +653,8 @@ class DSS(nn.Module):
         valid = valid_uniq[inv_idx].contiguous()         # [M, n_t]
 
         # ---- Stage2 ----
-        q_u   = self._user_query(eu_UI, eu_UB)          # [M, d]
+        users_flat = users.unsqueeze(1).expand(-1, n_b).reshape(M)
+        q_u   = self._user_query(eu_UI, eu_UB, users_flat)      # [M, d]
         s_new = self._stage2_score(q_u, V_b, valid)     # [M]
 
         # ---- Final: s = s_base + lambda * s_new ----
@@ -677,35 +693,24 @@ class DSS(nn.Module):
     # Forward  (training)
     # ------------------------------------------------------------------
 
-    def forward(self, batch, ED_drop=False):
+    def get_loss(self, embs, users, bundles, ED_drop=False):
         if ED_drop and self.conf.get("aug_type") == "ED":
             self._refresh_ed_graphs()
-        users, bundles = batch[0].squeeze(1), batch[1]
-        pos_bundles    = bundles[:, 0]
-
-        embs     = self.get_embeddings(test=False)
+            
         scores   = self.compute_scores(embs, users, bundles)
-        bpr_loss = cal_bpr_loss(scores)
+        pos  = scores[:, 0]
+        negs = scores[:, 1:]
+        # 벡터화된 BPR loss (동일 연산 구조 통일)
+        bpr_loss  = F.softplus(negs - pos.unsqueeze(1)).mean()
 
         if self.conf.get("c_lambda", 0.0) > 0:
-            c_loss = self.cal_c_loss(embs, users, pos_bundles)
+            pos_bundles = bundles[:, 0]
+            c_loss = self.cal_c_loss(embs, users.view(-1), pos_bundles)
         else:
             c_loss = torch.tensor(0.0, device=self.device)
 
-        # BPR Regularization Loss
-        bs = users.shape[0]
-        bundles_flat = bundles.view(-1)
-        u_emb_0 = self.users_feature[users]
-        b_emb_0 = self.bundles_feature[bundles_flat]
-        
-        safe_items = self.bundle_items[bundles_flat].clamp(min=0)
-        i_emb_0 = self.items_feature[safe_items]
-        valid_mask = (self.bundle_items[bundles_flat] >= 0).float()
-        i_emb_0 = i_emb_0 * valid_mask.unsqueeze(-1)
-        
-        reg_loss = (1/2)*(u_emb_0.norm(2).pow(2) + 
-                          b_emb_0.norm(2).pow(2) + 
-                          i_emb_0.norm(2).pow(2)) / float(bs)
+        # L2 reg는 optimizer weight_decay에서 처리되므로 여기에서는 0 반환
+        reg_loss = torch.tensor(0.0, device=self.device)
 
         return bpr_loss, c_loss, reg_loss
 
@@ -822,7 +827,8 @@ class DSS(nn.Module):
                 u1    = min(u0 + UC, bs)
                 eu_UI = UI_u_all[u0:u1]                                # [uc, d]
                 eu_UB = UB_u_all[u0:u1]                                # [uc, d]
-                q_uc  = self._user_query(eu_UI, eu_UB)                 # [uc, d]
+                users_uc = users[u0:u1]
+                q_uc  = self._user_query(eu_UI, eu_UB, users_uc)       # [uc, d]
                 q_proj = q_uc                                          # [uc, d]
 
                 # logits: [uc, NB, n_t]  (no expand of V tensors needed)
@@ -863,7 +869,8 @@ class DSS(nn.Module):
                     uc    = u1 - u0
                     eu_UI = UI_u_all[u0:u1]
                     eu_UB = UB_u_all[u0:u1]
-                    q_uc  = self._user_query(eu_UI, eu_UB)             # [uc, d]
+                    users_uc = users[u0:u1]
+                    q_uc  = self._user_query(eu_UI, eu_UB, users_uc)             # [uc, d]
 
                     q_exp   = q_uc.unsqueeze(1).expand(-1, bc, -1).reshape(uc * bc, d)
                     V_exp   = V_b_c.unsqueeze(0).expand(uc, -1, -1, -1).reshape(uc * bc, n_t, d)

@@ -138,14 +138,7 @@ NetEase_DSS:
   # WHATsNet bidirectional message passing
   num_bimp_layers: 1          # number of bundle↔item bidirectional layers
   num_inducing_bimp: 4        # inducing points for WithinATT
-  max_incident_K: 30          # max neighbour bundles per item (train)
-  eval_incident_K: 50         # max neighbour bundles per item (eval)
   bimp_tau: 0.5               # temperature for Stage2 softmax
-  eval_bundle_chunk: 512      # bundle chunk size during full-pass eval (legacy/fallback)
-  use_bimp_vb_for_stage2: true  # ablation: false = pre-BIMP tokens for stage2
-  bimp_eval_single_pass: true   # single-pass BIMP at eval (O(1) vs O(NB/BC) calls)
-  max_item_K_i2b: 40            # I→B token limit: top-K items per bundle (by BI+UI degree)
-  lambda_weight: 1.0            # Fixed lambda weight to bypass learnable parameter
   lambda_ubui: 1.0              # fixed parameter for DSS_Base_Degree
 
 
@@ -182,13 +175,7 @@ iFashion_DSS:
   # WHATsNet bidirectional message passing
   num_bimp_layers: 1
   num_inducing_bimp: 4
-  max_incident_K: 30
-  eval_incident_K: 50
   bimp_tau: 0.5
-  eval_bundle_chunk: 512
-  use_bimp_vb_for_stage2: true
-  bimp_eval_single_pass: true
-  lambda_weight: 1.0
   lambda_ubui: 1.0
 
 Youshu_DSS:
@@ -227,11 +214,5 @@ Youshu_DSS:
   K_bi_topk: 50
   num_bimp_layers: 1
   num_inducing_bimp: 4
-  max_incident_K: 30
-  eval_incident_K: 50
   bimp_tau: 0.5
-  eval_bundle_chunk: 512
   attn_drop: 0.5
-  use_bimp_vb_for_stage2: true
-  bimp_eval_single_pass: true
-  lambda_weight: 1.0
