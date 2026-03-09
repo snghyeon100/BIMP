@@ -37,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import scipy.sparse as sp
+import dgl
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +98,11 @@ class MAB(nn.Module):
         self.ln1 = nn.LayerNorm(d)
         self.attn_drop = nn.Dropout(p=attn_drop)
         self.scale = math.sqrt(self.hd)
+        
+        # Restored 2-layer FFN
+        self.fc1 = nn.Linear(d, d)
+        self.fc2 = nn.Linear(d, d)
+        self.ln2 = nn.LayerNorm(d)
 
     def forward(self, X, Y, mask_y=None):
         B, n_q, d = X.shape
@@ -118,7 +124,12 @@ class MAB(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, n_q, d)
 
         H = self.ln1(X + out)           # residual + layer-norm
-        return H                        # removed feed-forward + second layer-norm
+        
+        # Restored 2-layer FFN
+        out_ffn = self.fc2(F.relu(self.fc1(H)))
+        out_ffn = self.ln2(H + out_ffn)
+        
+        return out_ffn
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +270,50 @@ class DSS(nn.Module):
 
         self._build_graphs()
         self._build_item_bundles()
+        self._build_dgl_graphs()
 
     # ------------------------------------------------------------------
     # Graph helpers
     # ------------------------------------------------------------------
+
+
+    def _build_dgl_graphs(self):
+        bi = self.bundle_items
+        NB, n_t = bi.shape
+        b_idx = torch.arange(NB).unsqueeze(1).expand(NB, n_t)
+        valid = bi >= 0
+        v_b = b_idx[valid].to(self.device)
+        v_i = bi[valid].long()
+
+        self.g_b2i = dgl.heterograph({
+            ('bundle', 'contains', 'item'): (v_b, v_i),
+        }, num_nodes_dict={'bundle': self.num_bundles, 'item': self.num_items})
+
+        self.g_i2b = dgl.heterograph({
+            ('item', 'in', 'bundle'): (v_i, v_b)
+        }, num_nodes_dict={'item': self.num_items, 'bundle': self.num_bundles})
+        
+        def rank_norm(deg, valid_mask):
+            deg_f = deg.float().masked_fill(~valid_mask, -1.0)
+            order = deg_f.argsort(dim=-1, descending=True)
+            rank = torch.zeros_like(deg_f)
+            rank.scatter_(1, order, torch.arange(n_t, dtype=torch.float, device=self.device).unsqueeze(0).expand(NB, -1))
+            n_valid = valid_mask.sum(1, keepdim=True).float().clamp(min=2) - 1
+            rank_n = (rank / n_valid).clamp(0.0, 1.0)
+            return rank_n.masked_fill(~valid_mask, 0.0)
+
+        ui_deg = self._ui_item_deg[bi.clamp(min=0)]
+        bi_deg = self._bi_item_deg[bi.clamp(min=0)]
+        
+        rk_ui = rank_norm(ui_deg, valid)
+        rk_bi = rank_norm(bi_deg, valid)
+        rev_ui = (1.0 - rk_ui).masked_fill(~valid, 0.0)
+        
+        pe_raw = torch.stack([rk_ui, rk_bi, rev_ui], dim=-1) # [NB, n_t, 3]
+        pe_valid = pe_raw[valid] # [E, 3]
+        
+        self.g_i2b.edges['in'].data['pe_raw'] = pe_valid
+        self.g_b2i.edges['contains'].data['pe_raw'] = pe_valid
 
     def _make_prop_graph(self, bip, dropout=0.0):
         n, m  = bip.shape
@@ -403,404 +454,84 @@ class DSS(nn.Module):
     # §5  Positional Encoding
     # ------------------------------------------------------------------
 
-    def _compute_pe(self, items_2d, valid):
-        """
-        items_2d : [B, n_t]  item indices (clamped ≥0)
-        valid    : [B, n_t]  bool (True = real item)
-        Returns  : [B, n_t, d]  PE embedding to add to tokens
-        """
-        B, n_t = items_2d.shape
-        ui_deg = self._ui_item_deg[items_2d]   # [B, n_t]
-        bi_deg = self._bi_item_deg[items_2d]   # [B, n_t]
-
-        # Per-bundle rank normalised to [0, 1]
-        def rank_norm(deg, valid_mask):
-            # sort descending within each bundle row
-            # -inf for pads so they always sink to end
-            deg_f = deg.float().masked_fill(~valid_mask, -1.0)
-            # argsort twice for rank
-            order = deg_f.argsort(dim=-1, descending=True)
-            rank  = torch.zeros_like(deg_f)
-            rank.scatter_(1, order, torch.arange(n_t, dtype=torch.float,
-                                                 device=self.device).unsqueeze(0).expand(B, -1))
-            # Normalise: n-1 denominator (n = count of valid items per bundle)
-            n_valid = valid_mask.sum(1, keepdim=True).float().clamp(min=2) - 1   # [B,1]
-            rank_n  = (rank / n_valid).clamp(0.0, 1.0)
-            rank_n  = rank_n.masked_fill(~valid_mask, 0.0)
-            return rank_n
-
-        rk_ui  = rank_norm(ui_deg, valid)           # [B, n_t]  ascending rank
-        rk_bi  = rank_norm(bi_deg, valid)
-        rev_ui = (1.0 - rk_ui).masked_fill(~valid, 0.0)
-
-        pe_raw = torch.stack([rk_ui, rk_bi, rev_ui], dim=-1)      # [B, n_t, 3]
-        return self.W_pe(pe_raw)                                   # [B, n_t, d]
 
     # ------------------------------------------------------------------
-    # §2/4  WithinATT
+    # §2/4  WithinATT & DGL UDFs
     # ------------------------------------------------------------------
 
-    def _within_att(self, S_mab, T_mab, tokens, mask):
-        """
-        S = MAB(inducing, tokens)    # inducing queries tokens
-        T = MAB(tokens,   S)         # tokens query summary  ← Query=tokens
-        Returns T: [B, n_t, d]
-        """
+    def _within_att(self, S_mab, T_mab, tokens, mask=None):
         B   = tokens.shape[0]
         ind = self.bimp_I.unsqueeze(0).expand(B, -1, -1)   # [B, m, d]
-        S   = S_mab(ind,    tokens, mask_y=mask)            # [B, m, d]
-        T   = T_mab(tokens, S)                              # [B, n_t, d]
+        S   = S_mab(ind, tokens, mask_y=mask)              # [B, m, d]
+        T   = T_mab(tokens, S)                             # [B, n_t, d]
         return T
 
-    # ------------------------------------------------------------------
-    # §2.2-A  Item→Bundle update
-    # ------------------------------------------------------------------
+    def _i2b_msg(self, edges):
+        pe = self.W_pe(edges.data['pe_raw'])
+        return {'z': edges.src['h'] + pe}
 
-    def _item_to_bundle(self, X_i_g, H_b_g, bundles_uniq):
-        """
-        Args:
-            X_i_g      : [N_i, d] global item states
-            H_b_g      : [N_b, d] global bundle states
-            bundles_uniq: [U] unique bundle ids
+    def _i2b_reduce(self, nodes):
+        Z = nodes.mailbox['z']  # [B, deg, d]
+        V_b = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z, mask=None)
+        H_prev = nodes.data['h'].unsqueeze(1)  # [B, 1, d]
+        H_new = self.mab_i2b_main(H_prev, V_b, mask_y=None)  # [B, 1, d]
+        return {'h_new': H_new.squeeze(1)}
 
-        Returns:
-            H_b_new    : [N_b, d] updated bundle states (only bundles_uniq rows changed)
-        """
-        U   = bundles_uniq.shape[0]
-        d   = self.emb_size
-        BC  = 1024   # bundle chunk for memory
+    def _b2i_msg(self, edges):
+        pe = self.W_pe(edges.data['pe_raw'])
+        return {'g': edges.src['h'] + pe}
 
-        new_states = []
-        for i in range(0, U, BC):
-            ub_chunk = bundles_uniq[i: i + BC]    # [uc]
-            uc       = ub_chunk.shape[0]
-
-            items_c  = self.bundle_items[ub_chunk]          # [uc, n_t]
-            valid_c  = (items_c >= 0)                       # [uc, n_t]  bool
-            items_cs = items_c.clamp(min=0)
-
-            # Z_{i,b} = X_i^(l-1)
-            Z_c   = X_i_g[items_cs]                         # [uc, n_t, d]
-            Z_c   = Z_c.masked_fill(~valid_c.unsqueeze(-1), 0.0)
-
-            # WithinATT: V_b = MAB(Z, MAB(I, Z))
-            V_b   = self._within_att(self.mab_i2b_within, self.mab_i2b_outer,
-                                     Z_c, valid_c)          # [uc, n_t, d]
-
-            # H_b^(l) = MAB(H_b^(l-1), V_b)   ← bundle as query
-            H_prev = H_b_g[ub_chunk].unsqueeze(1)           # [uc, 1, d]
-            H_new  = self.mab_i2b_main(H_prev, V_b,
-                                        mask_y=valid_c)     # [uc, 1, d]
-            new_states.append((ub_chunk, H_new.squeeze(1))) # [uc, d]
-
-        # Scatter back
-        H_b_new = H_b_g.clone()
-        for idx, vals in new_states:
-            H_b_new[idx] = vals
-        return H_b_new
-
-    # ------------------------------------------------------------------
-    # §2.2-B  Bundle→Item update  (GPU-vectorized, no Python set / item loop)
-    # ------------------------------------------------------------------
-
-    def _bundle_to_item(self, X_i_loc, H_b_loc, H_b_init_full,
-                        items_uniq, active_mask_local,
-                        b_global2local, train):
-        """
-        GPU-vectorized B2I pass with extra-bundle context injection.
-
-        Active bundles (b ∈ B_batch):  use current H_b_loc[local_idx]
-        Extra  bundles (b ∈ N(i)\B_batch): use initial H_b_init_full[global_id]
-
-        E_i = { H_b^(l+1)+PE(b,i) | b∈N_act(i) }
-            ∪ { H_b^(0) +PE(b,i) | b∈N_extra(i) }
-        """
-        d = self.emb_size
-        K       = self.max_incident_K if train else self.eval_incident_K
-        K_extra = int(self.conf.get("K_extra", K))
-        V = items_uniq.shape[0]
-
-        # ------------------------------------------------------------------
-        # 1. Expand CSR → flat (item, bundle_global) edges
-        # ------------------------------------------------------------------
-        ptr_s = self.item_ptr[items_uniq]
-        ptr_e = self.item_ptr[items_uniq + 1]
-        raw_deg = ptr_e - ptr_s
-
-        if raw_deg.sum() == 0:
-            return X_i_loc
-
-        flat_item_local = torch.repeat_interleave(
-            torch.arange(V, device=self.device), raw_deg)
-
-        max_raw = int(raw_deg.max().item()) if raw_deg.numel() > 0 else 0
-        if max_raw == 0:
-            return X_i_loc
-
-        cum = torch.zeros(V + 1, dtype=torch.long, device=self.device)
-        cum[1:] = raw_deg.cumsum(0)
-        flat_local_offset = (torch.arange(raw_deg.sum(), device=self.device)
-                             - cum[flat_item_local])
-        flat_abs     = ptr_s[flat_item_local] + flat_local_offset
-        flat_bundles = self.item_adj[flat_abs]           # [total_edges] global bundle ids
-
-        # ------------------------------------------------------------------
-        # 2. Split into active / extra masks
-        # ------------------------------------------------------------------
-        act_mask_flat  = active_mask_local[flat_bundles]  # bool
-        flat_b_local   = b_global2local[flat_bundles]     # local idx (-1 = inactive)
-
-        # ---- active edges ----
-        keep_act       = act_mask_flat
-        fb_local_act   = flat_b_local[keep_act]
-        fi_act         = flat_item_local[keep_act]
-
-        # ---- extra edges (inactive bundles) ----
-        keep_ext       = ~act_mask_flat
-        fb_global_ext  = flat_bundles[keep_act.logical_not()]   # global bundle ids
-        fi_ext         = flat_item_local[keep_ext]
-
-        # ------------------------------------------------------------------
-        # 3. Active branch: recount, build padded [A, max_deg] tensor
-        # ------------------------------------------------------------------
-        act_deg = torch.zeros(V, dtype=torch.long, device=self.device)
-        if fi_act.numel() > 0:
-            act_deg.scatter_add_(0, fi_act, torch.ones_like(fi_act))
-
-        ext_deg = torch.zeros(V, dtype=torch.long, device=self.device)
-        if fi_ext.numel() > 0:
-            ext_deg.scatter_add_(0, fi_ext, torch.ones_like(fi_ext))
-
-        has_neigh = (act_deg + ext_deg) > 0
-        if not has_neigh.any():
-            return X_i_loc
-
-
-        act_item_idx = has_neigh.nonzero(as_tuple=True)[0]   # [A]
-        A = act_item_idx.shape[0]
-
-        item2comp = torch.full((V,), -1, dtype=torch.long, device=self.device)
-        item2comp[act_item_idx] = torch.arange(A, device=self.device)
-
-        # ---- build active padded tensor ----
-        def _build_padded(fi, fb, size, K_cap, use_global=False):
-            """
-            fi: flat item local indices
-            fb: flat bundle indices (local if not use_global, else global)
-            Returns neigh_pad [A, K_cap], valid [A, K_cap]
-            """
-            if fi.numel() == 0:
-                pad = torch.full((A, K_cap), -1, dtype=torch.long, device=self.device)
-                return pad, pad >= 0
-
-            comp = item2comp[fi]
-            valid_edge = comp >= 0
-            comp = comp[valid_edge]
-            fb   = fb[valid_edge]
-
-            deg_c = torch.zeros(A, dtype=torch.long, device=self.device)
-            deg_c.scatter_add_(0, comp, torch.ones_like(comp))
-            deg_capped = deg_c.clamp(max=K_cap)
-            max_d = int(deg_capped.max().item()) if deg_capped.numel() > 0 else 0
-            if max_d == 0:
-                return (torch.full((A, 1), -1, dtype=torch.long, device=self.device),
-                        torch.zeros(A, 1, dtype=torch.bool, device=self.device))
-
-            N_e = comp.shape[0]
-            gpos = torch.arange(N_e, device=self.device)
-            gs   = torch.zeros(A, dtype=torch.long, device=self.device)
-            gs.scatter_(0, comp.flip(0), gpos.flip(0))
-
-            intra = gpos - gs[comp]
-
-            if train:
-                noise    = torch.rand(N_e, device=self.device)
-                shuf_key = comp.float() * (K_cap + 2) + noise
-                so       = shuf_key.argsort()
-                comp     = comp[so]; fb = fb[so]
-                gs2      = torch.zeros(A, dtype=torch.long, device=self.device)
-                gs2.scatter_(0, comp.flip(0), gpos.flip(0))
-                intra    = gpos - gs2[comp]
-
-            keep = intra < K_cap
-            comp = comp[keep]; fb = fb[keep]; intra = intra[keep]
-            fb   = fb.clamp(0, size - 1)
-            intra= intra.clamp(0, max_d - 1)
-
-            pad = torch.full((A, max_d), -1, dtype=torch.long, device=self.device)
-            pad[comp, intra] = fb
-            return pad, pad >= 0
-
-        # Active: local bundle indices → H_b_loc
-        neigh_act, valid_act = _build_padded(
-            fi_act, fb_local_act, H_b_loc.shape[0], K)
-
-        # Extra: global bundle indices → H_b_init_full
-        neigh_ext, valid_ext = _build_padded(
-            fi_ext, fb_global_ext, H_b_init_full.shape[0], K_extra)
-
-        # ------------------------------------------------------------------
-        # 4. Build embedding tensors + PE, then concatenate
-        # ------------------------------------------------------------------
-        bundles_uniq_g = self._cur_bundles_uniq_global       # [U] global ids
-
-        # Active embeddings
-        E_act   = H_b_loc[neigh_act.clamp(0, H_b_loc.shape[0]-1)]
-        E_act   = E_act.masked_fill(~valid_act.unsqueeze(-1), 0.0)
-
-        # Extra embeddings (h_b^0, global ids)
-        E_ext   = H_b_init_full[neigh_ext.clamp(0, H_b_init_full.shape[0]-1)]
-        E_ext   = E_ext.masked_fill(~valid_ext.unsqueeze(-1), 0.0)
-
-        # Concatenate along token dim
-        E_comb     = torch.cat([E_act, E_ext], dim=1)        # [A, K+K_extra, d]
-        valid_comb = torch.cat([valid_act, valid_ext], dim=1) # [A, K+K_extra]
-
-        # One-time logging (first call per forward)
-        if getattr(self, '_log_extra_once', True):
-            n_act_mean  = valid_act.sum(1).float().mean().item()
-            n_ext_mean  = valid_ext.sum(1).float().mean().item()
-            n_use_mean  = valid_comb.sum(1).float().mean().item()
-            #print(f"[B2I ctx] mean |N_act|={n_act_mean:.1f}  "
-                  #f"|N_extra|={n_ext_mean:.1f}  |N_use|={n_use_mean:.1f}")
-            self._log_extra_once = False
-
-        # ------------------------------------------------------------------
-        # 5. WithinATT + MAB update
-        # ------------------------------------------------------------------
-        if not valid_comb.any():
-            return X_i_loc
-
-        G = self._within_att(self.mab_b2i_within, self.mab_b2i_outer,
-                             E_comb, valid_comb)               # [A, K+K_extra, d]
-
-        X_prev      = X_i_loc[act_item_idx].unsqueeze(1)      # [A, 1, d]
-        X_new       = self.mab_b2i_main(X_prev, G,
-                                        mask_y=valid_comb)     # [A, 1, d]
-        X_i_loc_new = X_i_loc.clone()
-        X_i_loc_new[act_item_idx] = X_new.squeeze(1)
-        return X_i_loc_new
+    def _b2i_reduce(self, nodes):
+        E_comb = nodes.mailbox['g']  # [B, deg, d]
+        G = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_comb, mask=None)
+        X_prev = nodes.data['h'].unsqueeze(1)
+        X_new = self.mab_b2i_main(X_prev, G, mask_y=None)
+        return {'h_new': X_new.squeeze(1)}
 
     # ------------------------------------------------------------------
     # §2 multi-layer bidirectional pass
     # ------------------------------------------------------------------
 
     def _bimp_forward(self, embs, bundles_uniq, items_uniq, train):
-        """
-        Run num_bimp_layers rounds of I→B then B→I  (local subgraph edition).
-
-        Allocates X_i_loc [V, d] and H_b_loc [U, d] — only the active subset —
-        instead of full [N_i, d] / [N_b, d] global tensors.
-
-        Args:
-            embs         : dict from get_embeddings
-            bundles_uniq : [U]  unique bundle ids (global)
-            items_uniq   : [V]  unique item ids that appear in bundles_uniq (global)
-            train        : bool
-
-        Returns:
-            H_b_g      : [N_b, d]   global bundle states (only bundles_uniq rows updated)
-            X_i_g      : [N_i, d]   global item states   (only items_uniq rows updated)
-            V_b_tokens : [U, n_t, d]  item tokens for Stage2
-            valid_V    : [U, n_t]     bool mask
-        """
-        U = bundles_uniq.shape[0]
-        V = items_uniq.shape[0]
-        d = self.emb_size
-        self._log_extra_once = True   # log N_act/N_extra/N_use once per forward pass
-
-        UI_i = embs["UI_items"]    # [N_i, d]
-        BI_i = embs["BI_items"]    # [N_i, d]
-        BI_b = embs["BI_bundles"]  # [N_b, d]
-        UB_b = embs["UB_bundles"]  # [N_b, d]
-
-        # ------------------------------------------------------------------
-        # Local subgraph: allocate only [V, d] and [U, d]
-        # ------------------------------------------------------------------
-        X_i_init_full = self._bimp_item_init(UI_i, BI_i)       # [N_i, d]  (needed for scatter-back)
-        H_b_init_full = self._bimp_bundle_init(BI_b, UB_b)      # [N_b, d]
-
-        # Local slices
-        X_i_loc = X_i_init_full[items_uniq].clone()        # [V, d]
-        H_b_loc = H_b_init_full[bundles_uniq].clone()      # [U, d]
-
-        # Ablation: capture pre-BIMP item tokens (used for Stage2 when flag=False)
         use_bimp_vb = self.conf.get("use_bimp_vb_for_stage2", True)
+
+        X_i_g = self._bimp_item_init(embs["UI_items"], embs["BI_items"])
+        H_b_g = self._bimp_bundle_init(embs["BI_bundles"], embs["UB_bundles"])
+        
         if not use_bimp_vb:
-            X_i_init_loc = X_i_loc.clone()                 # [V, d]  pre-BIMP snapshot
+            X_i_init_full = X_i_g.clone()
 
-        # ------------------------------------------------------------------
-        # active_mask [N_b] and b_global2local [N_b]  for GPU-vectorized B2I
-        # ------------------------------------------------------------------
-        active_mask = torch.zeros(self.num_bundles, dtype=torch.bool,
-                                  device=self.device)
-        active_mask[bundles_uniq] = True                    # [N_b]
-
-        b_global2local = torch.full((self.num_bundles,), -1,
-                                    dtype=torch.long, device=self.device)
-        b_global2local[bundles_uniq] = torch.arange(U, device=self.device)  # [N_b]
-
-        # Store as instance attrs so _bundle_to_item can read them
-        self._cur_bundles_uniq_global = bundles_uniq       # [U] global ids
-
-        # ------------------------------------------------------------------
-        # Precompute loop-invariant index maps (outside layer loop)
-        # ------------------------------------------------------------------
-        i_global2local = torch.full((self.num_items,), -1,
-                                    dtype=torch.long, device=self.device)
-        i_global2local[items_uniq] = torch.arange(V, device=self.device)
-
-        # bundle_items[bundles_uniq]: [U, n_t] global item ids (constant across layers)
-        items_loc_2d  = self.bundle_items[bundles_uniq]           # [U, n_t]
-        valid_loc     = (items_loc_2d >= 0)                       # [U, n_t]
-        items_loc_cs  = items_loc_2d.clamp(min=0)
-        items_loc_idx = i_global2local[items_loc_cs].clamp(min=0) # [U, n_t] local item idx
-
-        last_V_b_loc = None   # will hold the final-layer I→B WithinATT output
+        sg_i2b = dgl.node_subgraph(self.g_i2b, {'bundle': bundles_uniq, 'item': items_uniq})
+        sg_b2i = dgl.in_subgraph(self.g_b2i, {'item': items_uniq})
 
         for _ in range(self.num_bimp_layers):
-            # ------ (A) I→B  (local) ------
-            Z_loc   = X_i_loc[items_loc_idx]                          # [U, n_t, d]
-            Z_loc   = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
+            # (A) I→B
+            sg_i2b.nodes['item'].data['h'] = X_i_g[sg_i2b.nodes('item')]
+            sg_i2b.nodes['bundle'].data['h'] = H_b_g[sg_i2b.nodes('bundle')]
+            sg_i2b.update_all(self._i2b_msg, self._i2b_reduce, etype='in')
+            H_b_g[sg_i2b.nodes('bundle')] = sg_i2b.nodes['bundle'].data['h_new']
 
-            V_b_loc = self._within_att(self.mab_i2b_within, self.mab_i2b_outer,
-                                       Z_loc, valid_loc)              # [U, n_t, d]
-            last_V_b_loc = V_b_loc                                    # save for Stage2
-
-            H_prev  = H_b_loc.unsqueeze(1)                            # [U, 1, d]
-            H_new   = self.mab_i2b_main(H_prev, V_b_loc,
-                                        mask_y=valid_loc)             # [U, 1, d]
-            H_b_loc = H_new.squeeze(1)                                # [U, d]
-
-            # ------ (B) B→I  (local, GPU-vectorized) ------
+            # (B) B→I
             if self.conf.get("use_b2i", True):
-                X_i_loc = self._bundle_to_item(
-                    X_i_loc, H_b_loc, H_b_init_full,
-                    items_uniq, active_mask,
-                    b_global2local, train)                             # [V, d]
+                sg_b2i.nodes['bundle'].data['h'] = H_b_g[sg_b2i.nodes('bundle')]
+                sg_b2i.nodes['item'].data['h'] = X_i_g[sg_b2i.nodes('item')]
+                sg_b2i.update_all(self._b2i_msg, self._b2i_reduce, etype='contains')
+                X_i_g[sg_b2i.nodes('item')] = sg_b2i.nodes['item'].data['h_new']
 
-        # ------------------------------------------------------------------
-        # Stage2 bundle tokens: Use BIMP output or pre-BIMP snapshot
-        # shape: [U, n_t, d] (padding will be masked)
-        # ------------------------------------------------------------------
+        items_loc_2d  = self.bundle_items[bundles_uniq]
+        valid_loc     = (items_loc_2d >= 0)
+        items_loc_cs  = items_loc_2d.clamp(min=0)
+
         if use_bimp_vb:
-            V_b_raw = last_V_b_loc
+            Z_loc = X_i_g[items_loc_cs]
+            Z_loc = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
+            V_b_raw = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z_loc, mask=valid_loc)
         else:
-            V_b_raw = X_i_init_loc[items_loc_idx]  # Use pristine items
+            V_b_raw = X_i_init_full[items_loc_cs]
 
         V_b_tokens = V_b_raw.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
-        valid_V    = valid_loc                                         # [U, n_t]
-
-        # ------------------------------------------------------------------
-        # Scatter local states back to global tensors
-        # ------------------------------------------------------------------
-        H_b_g = H_b_init_full.clone()
-        H_b_g[bundles_uniq] = H_b_loc
-
-        X_i_g = X_i_init_full.clone()
-        X_i_g[items_uniq] = X_i_loc
-
-        return H_b_g, X_i_g, V_b_tokens, valid_V
+        
+        return H_b_g, X_i_g, V_b_tokens, valid_loc
 
     # ------------------------------------------------------------------
     # s_base: UI_u · mean(b_items_UI) + UB_u · UB_b
