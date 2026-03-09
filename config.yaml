@@ -131,7 +131,7 @@ NetEase_DSS:
 
   epochs: 50
   test_interval: 5
-
+  beta_bi: 0
   rerank_k: 1000          # Top-K by S_base for personalized S_syn re-ranking at eval
   hard_neg_prob: 0.3      # Probability of core-aware hard negative sampling
 
@@ -161,7 +161,7 @@ iFashion_DSS:
   ed_interval: 1
   embedding_sizes: [64]
   num_layerss: [2]
-
+  beta_bi: 0
   UB_ratios: [0.05]
   UI_ratios: [0.0]
   BI_ratios: [0.15]
@@ -197,8 +197,8 @@ Youshu_DSS:
   batch_size_test: 2048
   topk: [20, 40]
   neg_num: 1
-  lambda_weight: 0.2
-  lambda_ubui: 1.9
+  
+  lambda_ubui: 1
   core_k: 1
   aug_type: "Noise"
   ed_interval: 1
@@ -223,7 +223,7 @@ Youshu_DSS:
   test_interval: 5
   num_layers_options: [2]
   # WHATsNet bidirectional message passing
-  beta_bi: 0.1
+  beta_bi: 0
   K_bi_topk: 50
   num_bimp_layers: 1
   num_inducing_bimp: 4
