@@ -203,31 +203,31 @@ class DSS(nn.Module):
         attn_drop              = conf.get("attn_drop", 0.1)
 
         # ------------------------------------------------------------------
-        # §1.1 Item initial state:  X_i^(0) = LN(W_ui·UI_i + W_bi·BI_i)
+        # §1.1 Item initial state:  X_i^(0) = LN(s_ui * UI_i + s_bi * BI_i)
         # ------------------------------------------------------------------
-        self.W_ui        = nn.Linear(d, d, bias=False)
-        self.W_bi        = nn.Linear(d, d, bias=False)
+        self.scale_ui_i   = nn.Parameter(torch.ones(1, d))
+        self.scale_bi_i   = nn.Parameter(torch.ones(1, d))
         self.ln_item_init = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
-        # §1.2 Bundle initial state: H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)
+        # §1.2 Bundle initial state: H_b^(0) = LN(s_bi * BI_b + s_ub * UB_b)
         # ------------------------------------------------------------------
-        self.W_biB          = nn.Linear(d, d, bias=False)
-        self.W_ubB          = nn.Linear(d, d, bias=False)
+        self.scale_bi_b     = nn.Parameter(torch.ones(1, d))
+        self.scale_ub_b     = nn.Parameter(torch.ones(1, d))
         self.ln_bundle_init = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
-        # §1.3 User query: q_u = LN(W_uiq·UI_u + W_ubq·UB_u)
+        # §1.3 User query: q_u = LN(beta_u * s_ui * UI_u + (1-beta_u) * s_ub * UB_u)
         # ------------------------------------------------------------------
-        self.W_uiq      = nn.Linear(d, d, bias=False)
-        self.W_ubq      = nn.Linear(d, d, bias=False)
+        self.scale_ui_q = nn.Parameter(torch.ones(1, d))
+        self.scale_ub_q = nn.Parameter(torch.ones(1, d))
         self.ln_user_q  = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
         # §5 Positional Encoding: W_pe: Linear(3 → d)
         #    channels: rank_ui_deg, rank_bi_deg, rank_ub_deg
         # ------------------------------------------------------------------
-        self.W_pe = nn.Linear(3, d, bias=False)
+        # self.W_pe = nn.Linear(3, d, bias=False)
 
         # Precompute item degree vectors (UI and BI) for PE
         # These are computed post-graph-build so we store them as buffers
@@ -241,6 +241,7 @@ class DSS(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.norm_i2b = nn.LayerNorm(d)
         self.norm_b2i = nn.LayerNorm(d)
+        self.norm_self_attn = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
         # §1.4 Stage 2 (user queries bundle tokens)
@@ -457,17 +458,17 @@ class DSS(nn.Module):
     # ------------------------------------------------------------------
 
     def _bimp_item_init(self, UI_i, BI_i):
-        """X_i^(0) = LN(W_ui·UI_i + W_bi·BI_i)  →  [N_i, d]"""
-        return self.ln_item_init(self.W_ui(UI_i) + self.W_bi(BI_i))
+        """X_i^(0) = LN(s_ui * UI_i + s_bi * BI_i)  →  [N_i, d]"""
+        return self.ln_item_init(self.scale_ui_i * UI_i + self.scale_bi_i * BI_i)
 
     def _bimp_bundle_init(self, BI_b, UB_b):
-        """H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)  →  [N_b, d]"""
-        return self.ln_bundle_init(self.W_biB(BI_b) + self.W_ubB(UB_b))
+        """H_b^(0) = LN(s_bi * BI_b + s_ub * UB_b)  →  [N_b, d]"""
+        return self.ln_bundle_init(self.scale_bi_b * BI_b + self.scale_ub_b * UB_b)
 
     def _user_query(self, UI_u, UB_u, users_ids):
-        """q_u = LN(beta_u*W_uiq·UI_u + (1-beta_u)*W_ubq·UB_u)"""
+        """q_u = LN(beta_u * s_ui * UI_u + (1-beta_u) * s_ub * UB_u)"""
         bu = self.user_beta[users_ids].unsqueeze(-1)  # shape depends on users_ids
-        return self.ln_user_q(bu * self.W_uiq(UI_u) + (1.0 - bu) * self.W_ubq(UB_u))
+        return self.ln_user_q(bu * self.scale_ui_q * UI_u + (1.0 - bu) * self.scale_ub_q * UB_u)
 
     # ------------------------------------------------------------------
     # §5  Positional Encoding
@@ -479,8 +480,8 @@ class DSS(nn.Module):
     # ------------------------------------------------------------------
 
     def _edge_attn_i2b(self, edges):
-        pe = self.W_pe(edges.data['pe_raw'])
-        z  = edges.src['h'] + pe
+        # pe = self.W_pe(edges.data['pe_raw'])
+        z  = edges.src['h'] # + pe
         
         # pure dot product on full embedding size
         score = (edges.dst['q'] * z).sum(-1, keepdim=True) / (self.emb_size ** 0.5)
@@ -491,8 +492,8 @@ class DSS(nn.Module):
         return {'m': edges.data['v'] * alpha_dropped}
 
     def _edge_attn_b2i(self, edges):
-        pe = self.W_pe(edges.data['pe_raw'])
-        g  = edges.src['h'] + pe
+        # pe = self.W_pe(edges.data['pe_raw'])
+        g  = edges.src['h'] # + pe
         
         # pure dot product
         score = (edges.dst['q'] * g).sum(-1, keepdim=True) / (self.emb_size ** 0.5)
@@ -575,7 +576,7 @@ class DSS(nn.Module):
             
             # Output generation: [U, n_t_q, n_t_k] x [U, n_t_k, d] -> [U, n_t, d]
             attn_out = torch.einsum('uqk,ukd->uqd', attn, Z_loc)
-            V_b_raw = self.norm_i2b(Z_loc + attn_out)        # [U, n_t, d]
+            V_b_raw = self.norm_self_attn(Z_loc + attn_out)        # [U, n_t, d]
 
         else:
             V_b_raw = X_i_init_full[items_loc_cs]
@@ -642,6 +643,9 @@ class DSS(nn.Module):
         logits = logits.masked_fill(~valid, float('-inf'))
         alpha  = torch.nan_to_num(F.softmax(logits, dim=-1), nan=0.0)  # [M, n_t]
         self.last_alpha = alpha.detach() # Save for statistical analysis
+        
+        # Apply structured attention dropout to prevent Stage 2 overfitting
+        alpha  = self.attn_drop(alpha)
 
         h_bu   = (alpha.unsqueeze(-1) * V_b).sum(1)      # [M, d] - direct mix of V_b
         s_new  = (q_flat * h_bu).sum(-1)                 # [M]    - direct dot product
