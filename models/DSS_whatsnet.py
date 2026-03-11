@@ -236,22 +236,22 @@ class DSS(nn.Module):
         self.register_buffer("_bi_item_deg", torch.zeros(self.num_items))
 
         # ------------------------------------------------------------------
-        # Bidirectional MABs
-        #   I→B direction: WithinATT inner/outer + main
-        #   B→I direction: WithinATT inner/outer + main
+        # Bidirectional Fast Graph Attention (Replacing Mailbox MAB)
         # ------------------------------------------------------------------
         h = self.num_heads
-        self.mab_i2b_within = MAB(d, h, attn_drop=attn_drop)  # inner: MAB(I, tokens)
-        self.mab_i2b_outer  = MAB(d, h, attn_drop=attn_drop)  # outer: MAB(tokens, S)
-        self.mab_i2b_main   = MAB(d, h, attn_drop=attn_drop)  # H_b = MAB(H_b_prev, V_b)
-
-        self.mab_b2i_within = MAB(d, h, attn_drop=attn_drop)  # inner: MAB(I, tokens)
-        self.mab_b2i_outer  = MAB(d, h, attn_drop=attn_drop)  # outer: MAB(tokens, S)
-        self.mab_b2i_main   = MAB(d, h, attn_drop=attn_drop)  # X_i = MAB(X_i_prev, G_i)
-
-        # Learnable inducing points for WithinATT  [num_inducing_bimp, d]
-        self.bimp_I = nn.Parameter(torch.FloatTensor(self.num_inducing_bimp, d))
-        nn.init.xavier_normal_(self.bimp_I)
+        dh = d // h
+        
+        self.W_q_i2b = nn.Linear(d, d, bias=False)
+        self.W_k_i2b = nn.Linear(d, d, bias=False)
+        self.W_v_i2b = nn.Linear(d, d, bias=False)
+        self.W_o_i2b = nn.Linear(d, d, bias=False)
+        self.norm_i2b = nn.LayerNorm(d)
+        
+        self.W_q_b2i = nn.Linear(d, d, bias=False)
+        self.W_k_b2i = nn.Linear(d, d, bias=False)
+        self.W_v_b2i = nn.Linear(d, d, bias=False)
+        self.W_o_b2i = nn.Linear(d, d, bias=False)
+        self.norm_b2i = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
         # §1.4 Stage 2 (user queries bundle tokens)
@@ -486,67 +486,41 @@ class DSS(nn.Module):
 
 
     # ------------------------------------------------------------------
-    # §2/4  WithinATT & DGL UDFs
+    # Fast DGL Edge-Level Attention
     # ------------------------------------------------------------------
 
-    def _within_att(self, S_mab, T_mab, tokens, mask=None):
-        B   = tokens.shape[0]
-        ind = self.bimp_I.unsqueeze(0).expand(B, -1, -1)   # [B, m, d]
-        S   = S_mab(ind, tokens, mask_y=mask)              # [B, m, d]
-        T   = T_mab(tokens, S)                             # [B, n_t, d]
-        return T
-
-    def _i2b_msg(self, edges):
+    def _edge_attn_i2b(self, edges):
         pe = self.W_pe(edges.data['pe_raw'])
-        return {'z': edges.src['h'] + pe}
-
-    def _i2b_reduce(self, nodes):
-        Z = nodes.mailbox['z']  # [B, deg, d]
-        B = Z.shape[0]
-        chunk_size = 64
+        z  = edges.src['h'] + pe
         
-        if B > chunk_size:
-            H_new_list = []
-            H_prev_all = nodes.data['h'].unsqueeze(1)
-            for i in range(0, B, chunk_size):
-                Z_c = Z[i : i + chunk_size]
-                H_p = H_prev_all[i : i + chunk_size]
-                V_b_c = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z_c, mask=None)
-                H_new_c = self.mab_i2b_main(H_p, V_b_c, mask_y=None)
-                H_new_list.append(H_new_c)
-            H_new = torch.cat(H_new_list, dim=0)
-        else:
-            V_b = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z, mask=None)
-            H_prev = nodes.data['h'].unsqueeze(1)  # [B, 1, d]
-            H_new = self.mab_i2b_main(H_prev, V_b, mask_y=None)  # [B, 1, d]
-            
-        return {'h_new': H_new.squeeze(1)}
+        h = self.num_heads
+        dh = self.emb_size // h
+        
+        K = self.W_k_i2b(z).view(-1, h, dh)
+        V = self.W_v_i2b(z).view(-1, h, dh)
+        
+        # dot product
+        score = (edges.dst['q'] * K).sum(-1, keepdim=True) / (dh ** 0.5)
+        return {'score': score, 'v': V}
 
-    def _b2i_msg(self, edges):
+    def _msg_attn_i2b(self, edges):
+        return {'m': edges.data['v'] * edges.data['alpha']}
+
+    def _edge_attn_b2i(self, edges):
         pe = self.W_pe(edges.data['pe_raw'])
-        return {'g': edges.src['h'] + pe}
-
-    def _b2i_reduce(self, nodes):
-        E_comb = nodes.mailbox['g']  # [B, deg, d]
-        B = E_comb.shape[0]
-        chunk_size = 64
+        g  = edges.src['h'] + pe
         
-        if B > chunk_size:
-            X_new_list = []
-            X_prev_all = nodes.data['h'].unsqueeze(1)
-            for i in range(0, B, chunk_size):
-                E_c = E_comb[i : i + chunk_size]
-                X_p = X_prev_all[i : i + chunk_size]
-                G_c = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_c, mask=None)
-                X_new_c = self.mab_b2i_main(X_p, G_c, mask_y=None)
-                X_new_list.append(X_new_c)
-            X_new = torch.cat(X_new_list, dim=0)
-        else:
-            G = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_comb, mask=None)
-            X_prev = nodes.data['h'].unsqueeze(1)
-            X_new = self.mab_b2i_main(X_prev, G, mask_y=None)
-            
-        return {'h_new': X_new.squeeze(1)}
+        h = self.num_heads
+        dh = self.emb_size // h
+        
+        K = self.W_k_b2i(g).view(-1, h, dh)
+        V = self.W_v_b2i(g).view(-1, h, dh)
+        
+        score = (edges.dst['q'] * K).sum(-1, keepdim=True) / (dh ** 0.5)
+        return {'score': score, 'v': V}
+
+    def _msg_attn_b2i(self, edges):
+        return {'m': edges.data['v'] * edges.data['alpha']}
 
     # ------------------------------------------------------------------
     # §2 multi-layer bidirectional pass
@@ -567,16 +541,42 @@ class DSS(nn.Module):
         for _ in range(self.num_bimp_layers):
             # (A) I→B
             sg_i2b.nodes['item'].data['h'] = X_i_g[sg_i2b.nodes('item')]
-            sg_i2b.nodes['bundle'].data['h'] = H_b_g[sg_i2b.nodes('bundle')]
-            sg_i2b.update_all(self._i2b_msg, self._i2b_reduce, etype='in')
-            H_b_g[sg_i2b.nodes('bundle')] = sg_i2b.nodes['bundle'].data['h_new']
+            H_b_curr = H_b_g[sg_i2b.nodes('bundle')]
+            
+            # Bundle acts as Query
+            Q_i2b = self.W_q_i2b(H_b_curr).view(-1, self.num_heads, self.emb_size // self.num_heads)
+            sg_i2b.nodes['bundle'].data['q'] = Q_i2b
+            
+            # Apply edges: compute scores & V from Item -> Bundle
+            import dgl.function as fn
+            import dgl.ops as ops
+            sg_i2b.apply_edges(self._edge_attn_i2b, etype='in')
+            sg_i2b.edges['in'].data['alpha'] = ops.edge_softmax(sg_i2b, sg_i2b.edges['in'].data['score'])
+            sg_i2b.update_all(self._msg_attn_i2b, fn.sum('m', 'attn_out'), etype='in')
+            
+            attn_out_i2b = sg_i2b.nodes['bundle'].data['attn_out'].view(-1, self.emb_size)
+            H_b_new = self.norm_i2b(H_b_curr + self.W_o_i2b(attn_out_i2b))
+            
+            sg_i2b.nodes['bundle'].data['h_new'] = H_b_new
+            H_b_g[sg_i2b.nodes('bundle')] = H_b_new
 
             # (B) B→I
             if self.conf.get("use_b2i", True):
                 sg_b2i.nodes['bundle'].data['h'] = H_b_g[sg_b2i.nodes('bundle')]
-                sg_b2i.nodes['item'].data['h'] = X_i_g[sg_b2i.nodes('item')]
-                sg_b2i.update_all(self._b2i_msg, self._b2i_reduce, etype='contains')
-                X_i_g[sg_b2i.nodes('item')] = sg_b2i.nodes['item'].data['h_new']
+                X_i_curr = X_i_g[sg_b2i.nodes('item')]
+                
+                Q_b2i = self.W_q_b2i(X_i_curr).view(-1, self.num_heads, self.emb_size // self.num_heads)
+                sg_b2i.nodes['item'].data['q'] = Q_b2i
+                
+                sg_b2i.apply_edges(self._edge_attn_b2i, etype='contains')
+                sg_b2i.edges['contains'].data['alpha'] = ops.edge_softmax(sg_b2i, sg_b2i.edges['contains'].data['score'])
+                sg_b2i.update_all(self._msg_attn_b2i, fn.sum('m', 'attn_out'), etype='contains')
+                
+                attn_out_b2i = sg_b2i.nodes['item'].data['attn_out'].view(-1, self.emb_size)
+                X_i_new = self.norm_b2i(X_i_curr + self.W_o_b2i(attn_out_b2i))
+                
+                sg_b2i.nodes['item'].data['h_new'] = X_i_new
+                X_i_g[sg_b2i.nodes('item')] = X_i_new
 
         items_loc_2d  = self.bundle_items[bundles_uniq]
         valid_loc     = (items_loc_2d >= 0)
