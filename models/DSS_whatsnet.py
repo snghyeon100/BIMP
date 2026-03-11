@@ -282,9 +282,12 @@ class DSS(nn.Module):
         NB, n_t = bi.shape
         b_idx = torch.arange(NB).unsqueeze(1).expand(NB, n_t)
         valid = bi >= 0
-        v_b = b_idx[valid].to(self.device)
-        v_i = bi[valid].long()
+        
+        # [수정] 모든 인덱스 데이터를 CPU에서 준비 (DGL 그래프 생성 시 장치 통일을 위함)
+        v_b = b_idx[valid].cpu().long()
+        v_i = bi[valid].cpu().long()
 
+        # 1. CPU에서 그래프 생성
         self.g_b2i = dgl.heterograph({
             ('bundle', 'contains', 'item'): (v_b, v_i),
         }, num_nodes_dict={'bundle': self.num_bundles, 'item': self.num_items})
@@ -293,29 +296,41 @@ class DSS(nn.Module):
             ('item', 'in', 'bundle'): (v_i, v_b)
         }, num_nodes_dict={'item': self.num_items, 'bundle': self.num_bundles})
         
+        # 2. 그래프를 통째로 모델 장치(GPU)로 이동
+        self.g_b2i = self.g_b2i.to(self.device)
+        self.g_i2b = self.g_i2b.to(self.device)
+        
+        # 연산을 위해 valid 마스크도 GPU로 이동
+        valid_device = valid.to(self.device)
+
         def rank_norm(deg, valid_mask):
+            # deg와 valid_mask의 장치를 맞춤
             deg_f = deg.float().masked_fill(~valid_mask, -1.0)
             order = deg_f.argsort(dim=-1, descending=True)
             rank = torch.zeros_like(deg_f)
+            # torch.arange 생성 시 device를 명시하여 불필요한 복사 방지
             rank.scatter_(1, order, torch.arange(n_t, dtype=torch.float, device=self.device).unsqueeze(0).expand(NB, -1))
             n_valid = valid_mask.sum(1, keepdim=True).float().clamp(min=2) - 1
             rank_n = (rank / n_valid).clamp(0.0, 1.0)
             return rank_n.masked_fill(~valid_mask, 0.0)
 
-        ui_deg = self._ui_item_deg[bi.clamp(min=0)]
-        bi_deg = self._bi_item_deg[bi.clamp(min=0)]
+        # 3. Positional Encoding 데이터 준비 (GPU 상에서 연산)
+        bi_cs = bi.clamp(min=0).to(self.device)
+        ui_deg = self._ui_item_deg[bi_cs]
+        bi_deg = self._bi_item_deg[bi_cs]
         
-        rk_ui = rank_norm(ui_deg, valid)
-        rk_bi = rank_norm(bi_deg, valid)
+        rk_ui = rank_norm(ui_deg, valid_device)
+        rk_bi = rank_norm(bi_deg, valid_device)
         
-        # Globally normalize Bundle Popularity (UB Degree) to [0.0, 1.0]
+        # Globally normalize Bundle Popularity (UB Degree)
         max_ub = self._ub_bundle_deg.max().clamp(min=1.0)
         rk_ub  = (self._ub_bundle_deg / max_ub).unsqueeze(1).expand(NB, n_t)
-        rk_ub  = rk_ub.masked_fill(~valid, 0.0)
+        rk_ub  = rk_ub.masked_fill(~valid_device, 0.0)
         
         pe_raw = torch.stack([rk_ui, rk_bi, rk_ub], dim=-1) # [NB, n_t, 3]
-        pe_valid = pe_raw[valid] # [E, 3]
+        pe_valid = pe_raw[valid_device] # [E, 3]
         
+        # 4. GPU에 있는 그래프 데이터에 PE 값 할당
         self.g_i2b.edges['in'].data['pe_raw'] = pe_valid
         self.g_b2i.edges['contains'].data['pe_raw'] = pe_valid
 
@@ -693,10 +708,13 @@ class DSS(nn.Module):
     # Forward  (training)
     # ------------------------------------------------------------------
 
-    def get_loss(self, embs, users, bundles, ED_drop=False):
+    def forward(self, batch, ED_drop=False):
+        users, bundles = batch[0].squeeze(1), batch[1]
+        
         if ED_drop and self.conf.get("aug_type") == "ED":
             self._refresh_ed_graphs()
             
+        embs     = self.get_embeddings(test=False)
         scores   = self.compute_scores(embs, users, bundles)
         pos  = scores[:, 0]
         negs = scores[:, 1:]
