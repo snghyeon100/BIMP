@@ -127,10 +127,10 @@ class DSS_Base(nn.Module):
 
         self.beta        = nn.Parameter(torch.tensor(0.5))
         
-        # Bucket Embedding for Bonus Score
+        # Bucket Embedding for Bonus Score (1D Scalar)
         self.num_buckets = 20
-        self.bucket_emb  = nn.Embedding(self.num_buckets, self.emb_size)
-        nn.init.xavier_normal_(self.bucket_emb.weight)
+        self.bucket_emb  = nn.Embedding(self.num_buckets, 1)
+        nn.init.zeros_(self.bucket_emb.weight)
 
         # Build propagation graphs FIRST, then alpha_pt
         self._build_graphs()
@@ -299,20 +299,10 @@ class DSS_Base(nn.Module):
         n_valid_all    = mask_all.float().sum(dim=-1).clamp(min=1)
         mean_alpha_all = alpha_all_raw.sum(dim=-1) / n_valid_all
         
-        # Bucket Embedding for Bonus Score
+        # Bucket Embedding for Bonus Score (1D Scalar, User-Agnostic)
         bucket_idx = (mean_alpha_all * 10).long()
         bucket_idx = bucket_idx.clamp(min=0, max=self.num_buckets - 1) # [bs, n_b]
-        bonus_emb  = self.bucket_emb(bucket_idx)                       # [bs, n_b, d]
-        
-        # --- Ablation User Views for Bonus Score ---
-        u_view_UI = UI_u
-        u_view_UB = UB_u
-        u_view_combined = (UI_u + UB_u) / 2.0
-        
-        # Change this variable to test different views: u_view_UI, u_view_UB, u_view_combined
-        active_u_view = u_view_combined
-        
-        bonus_score = (active_u_view.unsqueeze(1) * bonus_emb).sum(-1)          # [bs, n_b]
+        bonus_score = self.bucket_emb(bucket_idx).squeeze(-1)          # [bs, n_b]
 
         ub_b_all = UB_b[bundles] # [bs, n_b, d]
         
@@ -444,20 +434,10 @@ class DSS_Base(nn.Module):
                 n_valid    = mask_c.float().sum(-1).clamp(min=1)        # [C]
                 mean_alpha = alpha_c_raw.sum(-1) / n_valid.unsqueeze(0)
                 
-                # Bucket Embedding for Bonus Score
+                # Bucket Embedding for Bonus Score (1D Scalar, User-Agnostic)
                 bucket_idx = (mean_alpha * 10).long()
                 bucket_idx = bucket_idx.clamp(min=0, max=self.num_buckets - 1)  # [uc, C]
-                bonus_emb  = self.bucket_emb(bucket_idx)                        # [uc, C, d]
-                
-                # --- Ablation User Views for Bonus Score ---
-                u_view_UI = UI_u
-                u_view_UB = UB_u
-                u_view_combined = (UI_u + UB_u) / 2.0
-                
-                # Change this variable to test different views: u_view_UI, u_view_UB, u_view_combined
-                active_u_view = u_view_combined
-                
-                bonus_score = (active_u_view.unsqueeze(1) * bonus_emb).sum(-1)           # [uc, C]
+                bonus_score = self.bucket_emb(bucket_idx).squeeze(-1)           # [uc, C]
                 
                 bonus_chunks.append(bonus_score)
 
