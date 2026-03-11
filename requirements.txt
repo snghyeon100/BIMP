@@ -1,7 +1,15 @@
-torch
-numpy
-scipy
-pyyaml
-tqdm
-tensorboard
-dgl
+# 핵심 엔진 (CUDA 12.1 호환)
+#torch==2.4.1
+#torchvision==0.19.1
+#torchaudio==2.4.1
+#torchdata==0.9.0
+
+# 그래프 라이브러리
+#dgl==2.4.0
+
+# 데이터 및 유틸리티
+numpy<2.0
+scipy==1.10.1
+pyyaml==6.0.1
+tqdm==4.66.4
+tensorboard==2.10.1

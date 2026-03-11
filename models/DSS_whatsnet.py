@@ -236,21 +236,10 @@ class DSS(nn.Module):
         self.register_buffer("_bi_item_deg", torch.zeros(self.num_items))
 
         # ------------------------------------------------------------------
-        # Bidirectional Fast Graph Attention (Replacing Mailbox MAB)
+        # Bidirectional Fast Graph Attention (Light-Attention, Parameter-free)
         # ------------------------------------------------------------------
-        h = self.num_heads
-        dh = d // h
-        
-        self.W_q_i2b = nn.Linear(d, d, bias=False)
-        self.W_k_i2b = nn.Linear(d, d, bias=False)
-        self.W_v_i2b = nn.Linear(d, d, bias=False)
-        self.W_o_i2b = nn.Linear(d, d, bias=False)
+        self.attn_drop = nn.Dropout(attn_drop)
         self.norm_i2b = nn.LayerNorm(d)
-        
-        self.W_q_b2i = nn.Linear(d, d, bias=False)
-        self.W_k_b2i = nn.Linear(d, d, bias=False)
-        self.W_v_b2i = nn.Linear(d, d, bias=False)
-        self.W_o_b2i = nn.Linear(d, d, bias=False)
         self.norm_b2i = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
@@ -493,34 +482,25 @@ class DSS(nn.Module):
         pe = self.W_pe(edges.data['pe_raw'])
         z  = edges.src['h'] + pe
         
-        h = self.num_heads
-        dh = self.emb_size // h
-        
-        K = self.W_k_i2b(z).view(-1, h, dh)
-        V = self.W_v_i2b(z).view(-1, h, dh)
-        
-        # dot product
-        score = (edges.dst['q'] * K).sum(-1, keepdim=True) / (dh ** 0.5)
-        return {'score': score, 'v': V}
+        # pure dot product on full embedding size
+        score = (edges.dst['q'] * z).sum(-1, keepdim=True) / (self.emb_size ** 0.5)
+        return {'score': score, 'v': z}
 
     def _msg_attn_i2b(self, edges):
-        return {'m': edges.data['v'] * edges.data['alpha']}
+        alpha_dropped = self.attn_drop(edges.data['alpha'])
+        return {'m': edges.data['v'] * alpha_dropped}
 
     def _edge_attn_b2i(self, edges):
         pe = self.W_pe(edges.data['pe_raw'])
         g  = edges.src['h'] + pe
         
-        h = self.num_heads
-        dh = self.emb_size // h
-        
-        K = self.W_k_b2i(g).view(-1, h, dh)
-        V = self.W_v_b2i(g).view(-1, h, dh)
-        
-        score = (edges.dst['q'] * K).sum(-1, keepdim=True) / (dh ** 0.5)
-        return {'score': score, 'v': V}
+        # pure dot product
+        score = (edges.dst['q'] * g).sum(-1, keepdim=True) / (self.emb_size ** 0.5)
+        return {'score': score, 'v': g}
 
     def _msg_attn_b2i(self, edges):
-        return {'m': edges.data['v'] * edges.data['alpha']}
+        alpha_dropped = self.attn_drop(edges.data['alpha'])
+        return {'m': edges.data['v'] * alpha_dropped}
 
     # ------------------------------------------------------------------
     # §2 multi-layer bidirectional pass
@@ -543,9 +523,8 @@ class DSS(nn.Module):
             sg_i2b.nodes['item'].data['h'] = X_i_g[sg_i2b.nodes('item')]
             H_b_curr = H_b_g[sg_i2b.nodes('bundle')]
             
-            # Bundle acts as Query
-            Q_i2b = self.W_q_i2b(H_b_curr).view(-1, self.num_heads, self.emb_size // self.num_heads)
-            sg_i2b.nodes['bundle'].data['q'] = Q_i2b
+            # Bundle acts as Query (Parameter-free)
+            sg_i2b.nodes['bundle'].data['q'] = H_b_curr
             
             # Apply edges: compute scores & V from Item -> Bundle
             import dgl.function as fn
@@ -554,8 +533,8 @@ class DSS(nn.Module):
             sg_i2b.edges['in'].data['alpha'] = ops.edge_softmax(sg_i2b, sg_i2b.edges['in'].data['score'])
             sg_i2b.update_all(self._msg_attn_i2b, fn.sum('m', 'attn_out'), etype='in')
             
-            attn_out_i2b = sg_i2b.nodes['bundle'].data['attn_out'].view(-1, self.emb_size)
-            H_b_new = self.norm_i2b(H_b_curr + self.W_o_i2b(attn_out_i2b))
+            attn_out_i2b = sg_i2b.nodes['bundle'].data['attn_out']
+            H_b_new = self.norm_i2b(H_b_curr + attn_out_i2b)
             
             sg_i2b.nodes['bundle'].data['h_new'] = H_b_new
             H_b_g[sg_i2b.nodes('bundle')] = H_b_new
@@ -565,15 +544,15 @@ class DSS(nn.Module):
                 sg_b2i.nodes['bundle'].data['h'] = H_b_g[sg_b2i.nodes('bundle')]
                 X_i_curr = X_i_g[sg_b2i.nodes('item')]
                 
-                Q_b2i = self.W_q_b2i(X_i_curr).view(-1, self.num_heads, self.emb_size // self.num_heads)
-                sg_b2i.nodes['item'].data['q'] = Q_b2i
+                # Item acts as Query
+                sg_b2i.nodes['item'].data['q'] = X_i_curr
                 
                 sg_b2i.apply_edges(self._edge_attn_b2i, etype='contains')
                 sg_b2i.edges['contains'].data['alpha'] = ops.edge_softmax(sg_b2i, sg_b2i.edges['contains'].data['score'])
                 sg_b2i.update_all(self._msg_attn_b2i, fn.sum('m', 'attn_out'), etype='contains')
                 
-                attn_out_b2i = sg_b2i.nodes['item'].data['attn_out'].view(-1, self.emb_size)
-                X_i_new = self.norm_b2i(X_i_curr + self.W_o_b2i(attn_out_b2i))
+                attn_out_b2i = sg_b2i.nodes['item'].data['attn_out']
+                X_i_new = self.norm_b2i(X_i_curr + attn_out_b2i)
                 
                 sg_b2i.nodes['item'].data['h_new'] = X_i_new
                 X_i_g[sg_b2i.nodes('item')] = X_i_new
@@ -586,25 +565,17 @@ class DSS(nn.Module):
             Z_loc = X_i_g[items_loc_cs]                     # [U, n_t, d]
             Z_loc = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
             
-            # Using the fast scaled dot-product substitute for the deleted _within_att
-            h = self.num_heads
-            dh = self.emb_size // h
-            
-            # Here V_b acts as a pooled representation of items in the bundle.
-            # We compute global attention using H_b_g as query across items.
-            H_b_q = H_b_g[bundles_uniq].unsqueeze(1)        # [U, 1, d]
-            Q = self.W_q_i2b(H_b_q).view(-1, 1, h, dh)      # [U, 1, h, dh]
-            K = self.W_k_i2b(Z_loc).view(-1, valid_loc.shape[-1], h, dh) # [U, n_t, h, dh]
-            V = self.W_v_i2b(Z_loc).view(-1, valid_loc.shape[-1], h, dh) # [U, n_t, h, dh]
-            
-            # Dot product attention: [U, h, 1, n_t]
-            scores = torch.einsum('ubhd,uthd->uhbt', Q, K).squeeze(2) / (dh ** 0.5)
+            # Using parameter-free pure dot-product self-attention
+            # Dot product self-attention: [U, n_t_q, n_t_k]
+            scores = torch.einsum('uqd,ukd->uqk', Z_loc, Z_loc) / (self.emb_size ** 0.5)
+            # Mask invalid keys (broadcast over query length)
             scores = scores.masked_fill(~valid_loc.unsqueeze(1), -1e9)
-            attn   = torch.softmax(scores, dim=-1)           # [U, h, n_t]
+            attn   = torch.softmax(scores, dim=-1)           # [U, n_t, n_t]
+            attn   = self.attn_drop(attn)                    # Dropout on attention weights
             
-            # Output generation: [U, h, 1, n_t] x [U, n_t, h, dh] -> [U, 1, h, dh]
-            V_b_raw = torch.einsum('uht,uthd->uhd', attn, V).reshape(-1, 1, self.emb_size) # [U, 1, d]
-            V_b_raw = V_b_raw.squeeze(1)                     # [U, d]
+            # Output generation: [U, n_t_q, n_t_k] x [U, n_t_k, d] -> [U, n_t, d]
+            attn_out = torch.einsum('uqk,ukd->uqd', attn, Z_loc)
+            V_b_raw = self.norm_i2b(Z_loc + attn_out)        # [U, n_t, d]
 
         else:
             V_b_raw = X_i_init_full[items_loc_cs]
