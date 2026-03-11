@@ -96,7 +96,7 @@ def main():
 
         # Instantiate DSS_whatsnet Model
         model = DSS_whatsnet_model(conf, dataset.graphs, dataset.bundle_info).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
 
         batch_cnt        = len(dataset.train_loader)
         test_interval_bs = int(batch_cnt * conf["test_interval"])
@@ -120,7 +120,7 @@ def main():
                            (batch_anchor + 1) % ed_interval_bs == 0)
 
                 bpr_loss, c_loss, reg_loss = model(batch, ED_drop=ED_drop)
-                loss = bpr_loss + c_lambda * c_loss + l2_reg * reg_loss
+                loss = bpr_loss + c_lambda * c_loss
                 
                 loss.backward()
                 optimizer.step()

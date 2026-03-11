@@ -203,31 +203,31 @@ class DSS(nn.Module):
         attn_drop              = conf.get("attn_drop", 0.1)
 
         # ------------------------------------------------------------------
-        # §1.1 Item initial state:  X_i^(0) = LN(W_ui·UI_i + W_bi·BI_i)
+        # §1.1 Item initial state:  X_i^(0) = LN(s_ui * UI_i + s_bi * BI_i)
         # ------------------------------------------------------------------
-        self.W_ui        = nn.Linear(d, d, bias=False)
-        self.W_bi        = nn.Linear(d, d, bias=False)
+        self.scale_ui_i   = nn.Parameter(torch.ones(1, d))
+        self.scale_bi_i   = nn.Parameter(torch.ones(1, d))
         self.ln_item_init = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
-        # §1.2 Bundle initial state: H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)
+        # §1.2 Bundle initial state: H_b^(0) = LN(s_bi * BI_b + s_ub * UB_b)
         # ------------------------------------------------------------------
-        self.W_biB          = nn.Linear(d, d, bias=False)
-        self.W_ubB          = nn.Linear(d, d, bias=False)
+        self.scale_bi_b     = nn.Parameter(torch.ones(1, d))
+        self.scale_ub_b     = nn.Parameter(torch.ones(1, d))
         self.ln_bundle_init = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
-        # §1.3 User query: q_u = LN(W_uiq·UI_u + W_ubq·UB_u)
+        # §1.3 User query: q_u = LN(beta_u * s_ui * UI_u + (1-beta_u) * s_ub * UB_u)
         # ------------------------------------------------------------------
-        self.W_uiq      = nn.Linear(d, d, bias=False)
-        self.W_ubq      = nn.Linear(d, d, bias=False)
+        self.scale_ui_q = nn.Parameter(torch.ones(1, d))
+        self.scale_ub_q = nn.Parameter(torch.ones(1, d))
         self.ln_user_q  = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
         # §5 Positional Encoding: W_pe: Linear(3 → d)
         #    channels: rank_ui_deg, rank_bi_deg, rank_ub_deg
         # ------------------------------------------------------------------
-        self.W_pe = nn.Linear(3, d, bias=False)
+        # self.W_pe = nn.Linear(3, d, bias=False)
 
         # Precompute item degree vectors (UI and BI) for PE
         # These are computed post-graph-build so we store them as buffers
@@ -236,22 +236,12 @@ class DSS(nn.Module):
         self.register_buffer("_bi_item_deg", torch.zeros(self.num_items))
 
         # ------------------------------------------------------------------
-        # Bidirectional MABs
-        #   I→B direction: WithinATT inner/outer + main
-        #   B→I direction: WithinATT inner/outer + main
+        # Bidirectional Fast Graph Attention (Light-Attention, Parameter-free)
         # ------------------------------------------------------------------
-        h = self.num_heads
-        self.mab_i2b_within = MAB(d, h, attn_drop=attn_drop)  # inner: MAB(I, tokens)
-        self.mab_i2b_outer  = MAB(d, h, attn_drop=attn_drop)  # outer: MAB(tokens, S)
-        self.mab_i2b_main   = MAB(d, h, attn_drop=attn_drop)  # H_b = MAB(H_b_prev, V_b)
-
-        self.mab_b2i_within = MAB(d, h, attn_drop=attn_drop)  # inner: MAB(I, tokens)
-        self.mab_b2i_outer  = MAB(d, h, attn_drop=attn_drop)  # outer: MAB(tokens, S)
-        self.mab_b2i_main   = MAB(d, h, attn_drop=attn_drop)  # X_i = MAB(X_i_prev, G_i)
-
-        # Learnable inducing points for WithinATT  [num_inducing_bimp, d]
-        self.bimp_I = nn.Parameter(torch.FloatTensor(self.num_inducing_bimp, d))
-        nn.init.xavier_normal_(self.bimp_I)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.norm_i2b = nn.LayerNorm(d)
+        self.norm_b2i = nn.LayerNorm(d)
+        self.norm_self_attn = nn.LayerNorm(d)
 
         # ------------------------------------------------------------------
         # §1.4 Stage 2 (user queries bundle tokens)
@@ -282,9 +272,12 @@ class DSS(nn.Module):
         NB, n_t = bi.shape
         b_idx = torch.arange(NB).unsqueeze(1).expand(NB, n_t)
         valid = bi >= 0
-        v_b = b_idx[valid].to(self.device)
-        v_i = bi[valid].long()
+        
+        # [수정] 모든 인덱스 데이터를 CPU에서 준비 (DGL 그래프 생성 시 장치 통일을 위함)
+        v_b = b_idx[valid].cpu().long()
+        v_i = bi[valid].cpu().long()
 
+        # 1. CPU에서 그래프 생성
         self.g_b2i = dgl.heterograph({
             ('bundle', 'contains', 'item'): (v_b, v_i),
         }, num_nodes_dict={'bundle': self.num_bundles, 'item': self.num_items})
@@ -293,29 +286,41 @@ class DSS(nn.Module):
             ('item', 'in', 'bundle'): (v_i, v_b)
         }, num_nodes_dict={'item': self.num_items, 'bundle': self.num_bundles})
         
+        # 2. 그래프를 통째로 모델 장치(GPU)로 이동
+        self.g_b2i = self.g_b2i.to(self.device)
+        self.g_i2b = self.g_i2b.to(self.device)
+        
+        # 연산을 위해 valid 마스크도 GPU로 이동
+        valid_device = valid.to(self.device)
+
         def rank_norm(deg, valid_mask):
+            # deg와 valid_mask의 장치를 맞춤
             deg_f = deg.float().masked_fill(~valid_mask, -1.0)
             order = deg_f.argsort(dim=-1, descending=True)
             rank = torch.zeros_like(deg_f)
+            # torch.arange 생성 시 device를 명시하여 불필요한 복사 방지
             rank.scatter_(1, order, torch.arange(n_t, dtype=torch.float, device=self.device).unsqueeze(0).expand(NB, -1))
             n_valid = valid_mask.sum(1, keepdim=True).float().clamp(min=2) - 1
             rank_n = (rank / n_valid).clamp(0.0, 1.0)
             return rank_n.masked_fill(~valid_mask, 0.0)
 
-        ui_deg = self._ui_item_deg[bi.clamp(min=0)]
-        bi_deg = self._bi_item_deg[bi.clamp(min=0)]
+        # 3. Positional Encoding 데이터 준비 (GPU 상에서 연산)
+        bi_cs = bi.clamp(min=0).to(self.device)
+        ui_deg = self._ui_item_deg[bi_cs]
+        bi_deg = self._bi_item_deg[bi_cs]
         
-        rk_ui = rank_norm(ui_deg, valid)
-        rk_bi = rank_norm(bi_deg, valid)
+        rk_ui = rank_norm(ui_deg, valid_device)
+        rk_bi = rank_norm(bi_deg, valid_device)
         
-        # Globally normalize Bundle Popularity (UB Degree) to [0.0, 1.0]
+        # Globally normalize Bundle Popularity (UB Degree)
         max_ub = self._ub_bundle_deg.max().clamp(min=1.0)
         rk_ub  = (self._ub_bundle_deg / max_ub).unsqueeze(1).expand(NB, n_t)
-        rk_ub  = rk_ub.masked_fill(~valid, 0.0)
+        rk_ub  = rk_ub.masked_fill(~valid_device, 0.0)
         
         pe_raw = torch.stack([rk_ui, rk_bi, rk_ub], dim=-1) # [NB, n_t, 3]
-        pe_valid = pe_raw[valid] # [E, 3]
+        pe_valid = pe_raw[valid_device] # [E, 3]
         
+        # 4. GPU에 있는 그래프 데이터에 PE 값 할당
         self.g_i2b.edges['in'].data['pe_raw'] = pe_valid
         self.g_b2i.edges['contains'].data['pe_raw'] = pe_valid
 
@@ -453,17 +458,17 @@ class DSS(nn.Module):
     # ------------------------------------------------------------------
 
     def _bimp_item_init(self, UI_i, BI_i):
-        """X_i^(0) = LN(W_ui·UI_i + W_bi·BI_i)  →  [N_i, d]"""
-        return self.ln_item_init(self.W_ui(UI_i) + self.W_bi(BI_i))
+        """X_i^(0) = LN(s_ui * UI_i + s_bi * BI_i)  →  [N_i, d]"""
+        return self.ln_item_init(self.scale_ui_i * UI_i + self.scale_bi_i * BI_i)
 
     def _bimp_bundle_init(self, BI_b, UB_b):
-        """H_b^(0) = LN(W_biB·BI_b + W_ubB·UB_b)  →  [N_b, d]"""
-        return self.ln_bundle_init(self.W_biB(BI_b) + self.W_ubB(UB_b))
+        """H_b^(0) = LN(s_bi * BI_b + s_ub * UB_b)  →  [N_b, d]"""
+        return self.ln_bundle_init(self.scale_bi_b * BI_b + self.scale_ub_b * UB_b)
 
     def _user_query(self, UI_u, UB_u, users_ids):
-        """q_u = LN(beta_u*W_uiq·UI_u + (1-beta_u)*W_ubq·UB_u)"""
+        """q_u = LN(beta_u * s_ui * UI_u + (1-beta_u) * s_ub * UB_u)"""
         bu = self.user_beta[users_ids].unsqueeze(-1)  # shape depends on users_ids
-        return self.ln_user_q(bu * self.W_uiq(UI_u) + (1.0 - bu) * self.W_ubq(UB_u))
+        return self.ln_user_q(bu * self.scale_ui_q * UI_u + (1.0 - bu) * self.scale_ub_q * UB_u)
 
     # ------------------------------------------------------------------
     # §5  Positional Encoding
@@ -471,37 +476,32 @@ class DSS(nn.Module):
 
 
     # ------------------------------------------------------------------
-    # §2/4  WithinATT & DGL UDFs
+    # Fast DGL Edge-Level Attention
     # ------------------------------------------------------------------
 
-    def _within_att(self, S_mab, T_mab, tokens, mask=None):
-        B   = tokens.shape[0]
-        ind = self.bimp_I.unsqueeze(0).expand(B, -1, -1)   # [B, m, d]
-        S   = S_mab(ind, tokens, mask_y=mask)              # [B, m, d]
-        T   = T_mab(tokens, S)                             # [B, n_t, d]
-        return T
+    def _edge_attn_i2b(self, edges):
+        # pe = self.W_pe(edges.data['pe_raw'])
+        z  = edges.src['h'] # + pe
+        
+        # pure dot product on full embedding size
+        score = (edges.dst['q'] * z).sum(-1, keepdim=True) / (self.emb_size ** 0.5)
+        return {'score': score, 'v': z}
 
-    def _i2b_msg(self, edges):
-        pe = self.W_pe(edges.data['pe_raw'])
-        return {'z': edges.src['h'] + pe}
+    def _msg_attn_i2b(self, edges):
+        alpha_dropped = self.attn_drop(edges.data['alpha'])
+        return {'m': edges.data['v'] * alpha_dropped}
 
-    def _i2b_reduce(self, nodes):
-        Z = nodes.mailbox['z']  # [B, deg, d]
-        V_b = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z, mask=None)
-        H_prev = nodes.data['h'].unsqueeze(1)  # [B, 1, d]
-        H_new = self.mab_i2b_main(H_prev, V_b, mask_y=None)  # [B, 1, d]
-        return {'h_new': H_new.squeeze(1)}
+    def _edge_attn_b2i(self, edges):
+        # pe = self.W_pe(edges.data['pe_raw'])
+        g  = edges.src['h'] # + pe
+        
+        # pure dot product
+        score = (edges.dst['q'] * g).sum(-1, keepdim=True) / (self.emb_size ** 0.5)
+        return {'score': score, 'v': g}
 
-    def _b2i_msg(self, edges):
-        pe = self.W_pe(edges.data['pe_raw'])
-        return {'g': edges.src['h'] + pe}
-
-    def _b2i_reduce(self, nodes):
-        E_comb = nodes.mailbox['g']  # [B, deg, d]
-        G = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_comb, mask=None)
-        X_prev = nodes.data['h'].unsqueeze(1)
-        X_new = self.mab_b2i_main(X_prev, G, mask_y=None)
-        return {'h_new': X_new.squeeze(1)}
+    def _msg_attn_b2i(self, edges):
+        alpha_dropped = self.attn_drop(edges.data['alpha'])
+        return {'m': edges.data['v'] * alpha_dropped}
 
     # ------------------------------------------------------------------
     # §2 multi-layer bidirectional pass
@@ -522,25 +522,62 @@ class DSS(nn.Module):
         for _ in range(self.num_bimp_layers):
             # (A) I→B
             sg_i2b.nodes['item'].data['h'] = X_i_g[sg_i2b.nodes('item')]
-            sg_i2b.nodes['bundle'].data['h'] = H_b_g[sg_i2b.nodes('bundle')]
-            sg_i2b.update_all(self._i2b_msg, self._i2b_reduce, etype='in')
-            H_b_g[sg_i2b.nodes('bundle')] = sg_i2b.nodes['bundle'].data['h_new']
+            H_b_curr = H_b_g[sg_i2b.nodes('bundle')]
+            
+            # Bundle acts as Query (Parameter-free)
+            sg_i2b.nodes['bundle'].data['q'] = H_b_curr
+            
+            # Apply edges: compute scores & V from Item -> Bundle
+            import dgl.function as fn
+            import dgl.ops as ops
+            sg_i2b.apply_edges(self._edge_attn_i2b, etype='in')
+            sg_i2b.edges['in'].data['alpha'] = ops.edge_softmax(sg_i2b, sg_i2b.edges['in'].data['score'])
+            sg_i2b.update_all(self._msg_attn_i2b, fn.sum('m', 'attn_out'), etype='in')
+            
+            attn_out_i2b = sg_i2b.nodes['bundle'].data['attn_out']
+            H_b_new = self.norm_i2b(H_b_curr + attn_out_i2b)
+            
+            sg_i2b.nodes['bundle'].data['h_new'] = H_b_new
+            H_b_g[sg_i2b.nodes('bundle')] = H_b_new
 
             # (B) B→I
             if self.conf.get("use_b2i", True):
                 sg_b2i.nodes['bundle'].data['h'] = H_b_g[sg_b2i.nodes('bundle')]
-                sg_b2i.nodes['item'].data['h'] = X_i_g[sg_b2i.nodes('item')]
-                sg_b2i.update_all(self._b2i_msg, self._b2i_reduce, etype='contains')
-                X_i_g[sg_b2i.nodes('item')] = sg_b2i.nodes['item'].data['h_new']
+                X_i_curr = X_i_g[sg_b2i.nodes('item')]
+                
+                # Item acts as Query
+                sg_b2i.nodes['item'].data['q'] = X_i_curr
+                
+                sg_b2i.apply_edges(self._edge_attn_b2i, etype='contains')
+                sg_b2i.edges['contains'].data['alpha'] = ops.edge_softmax(sg_b2i, sg_b2i.edges['contains'].data['score'])
+                sg_b2i.update_all(self._msg_attn_b2i, fn.sum('m', 'attn_out'), etype='contains')
+                
+                attn_out_b2i = sg_b2i.nodes['item'].data['attn_out']
+                X_i_new = self.norm_b2i(X_i_curr + attn_out_b2i)
+                
+                sg_b2i.nodes['item'].data['h_new'] = X_i_new
+                X_i_g[sg_b2i.nodes('item')] = X_i_new
 
         items_loc_2d  = self.bundle_items[bundles_uniq]
         valid_loc     = (items_loc_2d >= 0)
         items_loc_cs  = items_loc_2d.clamp(min=0)
 
         if use_bimp_vb:
-            Z_loc = X_i_g[items_loc_cs]
+            Z_loc = X_i_g[items_loc_cs]                     # [U, n_t, d]
             Z_loc = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
-            V_b_raw = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z_loc, mask=valid_loc)
+            
+            # Using parameter-free pure dot-product self-attention
+            # Dot product self-attention: [U, n_t_q, n_t_k]
+            scores = torch.einsum('uqd,ukd->uqk', Z_loc, Z_loc) / (self.emb_size ** 0.5)
+            # Mask invalid keys (broadcast over query length)
+            scores = scores.masked_fill(~valid_loc.unsqueeze(1), -1e9)
+            attn   = torch.softmax(scores, dim=-1)           # [U, n_t, n_t]
+            attn   = self.attn_drop(attn)                    # Dropout on attention weights
+            
+            # Output generation: [U, n_t_q, n_t_k] x [U, n_t_k, d] -> [U, n_t, d]
+            attn_out = torch.einsum('uqk,ukd->uqd', attn, Z_loc)
+            V_b_raw = self.norm_self_attn(Z_loc + attn_out)        # [U, n_t, d]
+
         else:
             V_b_raw = X_i_init_full[items_loc_cs]
 
@@ -606,6 +643,9 @@ class DSS(nn.Module):
         logits = logits.masked_fill(~valid, float('-inf'))
         alpha  = torch.nan_to_num(F.softmax(logits, dim=-1), nan=0.0)  # [M, n_t]
         self.last_alpha = alpha.detach() # Save for statistical analysis
+        
+        # Apply structured attention dropout to prevent Stage 2 overfitting
+        alpha  = self.attn_drop(alpha)
 
         h_bu   = (alpha.unsqueeze(-1) * V_b).sum(1)      # [M, d] - direct mix of V_b
         s_new  = (q_flat * h_bu).sum(-1)                 # [M]    - direct dot product
@@ -693,10 +733,13 @@ class DSS(nn.Module):
     # Forward  (training)
     # ------------------------------------------------------------------
 
-    def get_loss(self, embs, users, bundles, ED_drop=False):
+    def forward(self, batch, ED_drop=False):
+        users, bundles = batch[0].squeeze(1), batch[1]
+        
         if ED_drop and self.conf.get("aug_type") == "ED":
             self._refresh_ed_graphs()
             
+        embs     = self.get_embeddings(test=False)
         scores   = self.compute_scores(embs, users, bundles)
         pos  = scores[:, 0]
         negs = scores[:, 1:]
