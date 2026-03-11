@@ -583,19 +583,29 @@ class DSS(nn.Module):
         items_loc_cs  = items_loc_2d.clamp(min=0)
 
         if use_bimp_vb:
-            Z_loc = X_i_g[items_loc_cs]
+            Z_loc = X_i_g[items_loc_cs]                     # [U, n_t, d]
             Z_loc = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
             
-            U = Z_loc.shape[0]
-            chunk_size = 64
-            V_b_raw_list = []
-            for i in range(0, U, chunk_size):
-                end_idx = min(i + chunk_size, U)
-                z_chunk = Z_loc[i:end_idx]
-                mask_chunk = valid_loc[i:end_idx]
-                vb_chunk = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, z_chunk, mask=mask_chunk)
-                V_b_raw_list.append(vb_chunk)
-            V_b_raw = torch.cat(V_b_raw_list, dim=0)
+            # Using the fast scaled dot-product substitute for the deleted _within_att
+            h = self.num_heads
+            dh = self.emb_size // h
+            
+            # Here V_b acts as a pooled representation of items in the bundle.
+            # We compute global attention using H_b_g as query across items.
+            H_b_q = H_b_g[bundles_uniq].unsqueeze(1)        # [U, 1, d]
+            Q = self.W_q_i2b(H_b_q).view(-1, 1, h, dh)      # [U, 1, h, dh]
+            K = self.W_k_i2b(Z_loc).view(-1, valid_loc.shape[-1], h, dh) # [U, n_t, h, dh]
+            V = self.W_v_i2b(Z_loc).view(-1, valid_loc.shape[-1], h, dh) # [U, n_t, h, dh]
+            
+            # Dot product attention: [U, h, 1, n_t]
+            scores = torch.einsum('ubhd,uthd->uhbt', Q, K).squeeze(2) / (dh ** 0.5)
+            scores = scores.masked_fill(~valid_loc.unsqueeze(1), -1e9)
+            attn   = torch.softmax(scores, dim=-1)           # [U, h, n_t]
+            
+            # Output generation: [U, h, 1, n_t] x [U, n_t, h, dh] -> [U, 1, h, dh]
+            V_b_raw = torch.einsum('uht,uthd->uhd', attn, V).reshape(-1, 1, self.emb_size) # [U, 1, d]
+            V_b_raw = V_b_raw.squeeze(1)                     # [U, d]
+
         else:
             V_b_raw = X_i_init_full[items_loc_cs]
 
