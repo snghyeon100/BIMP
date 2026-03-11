@@ -1,7 +1,7 @@
-torch
-numpy
-scipy
-pyyaml
-tqdm
-tensorboard
-dgl
+torch==1.12.1+cu113
+numpy==1.23.5
+scipy==1.10.1
+pyyaml==6.0.1
+tqdm==4.66.4
+tensorboard==2.10.1
+dgl-cu113==0.9.0

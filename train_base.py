@@ -201,11 +201,7 @@ def main():
         # Final best-model analysis
         # ------------------------------------------------------------------
         print("\n" + "=" * 60)
-        print("Training finished. Running final statistical analysis ...")
-        if os.path.isfile(checkpoint_model_path):
-            model.load_state_dict(torch.load(checkpoint_model_path, map_location=device))
-            print(f"Loaded best model from {checkpoint_model_path}")
-        compute_analysis_stats(model, dataset, conf, log_path)
+        print("Training finished.")
         print("=" * 60 + "\n")
 
         run.close()
@@ -359,143 +355,7 @@ def get_ndcg(pred, grd, is_hit, topk):
     return [ndcg.sum().item(), denorm]
 
 
-# ---------------------------------------------------------------------------
-# Statistical analysis functions
-# ---------------------------------------------------------------------------
 
-def compute_analysis_stats(model, dataset, conf, log_path):
-    """
-    Computes and logs:
-      1. Group-wise Recall@20/NDCG@20 (Organic vs Contextual)
-      2. Score Contribution (S_base / S_syn / S_cont %)
-    """
-    device    = conf["device"]
-    topk_eval = 20
-
-    model.eval()
-    with torch.no_grad():
-        embs = model.get_embeddings(test=True)
-
-    u_i_graph   = dataset.u_i_graph           # scipy sparse [N_u, N_i]
-    core_items_np = model.core_items.cpu().numpy()  # [N_b, core_k]
-
-    # Accumulators for group-wise metrics
-    org_tmp = {m: {topk_eval: [0, 0]} for m in ["recall", "ndcg"]}
-    ctx_tmp = {m: {topk_eval: [0, 0]} for m in ["recall", "ndcg"]}
-    org_users_seen, ctx_users_seen = 0, 0
-
-    # Accumulators for score contribution
-    contrib_base, contrib_syn, contrib_cont = [], [], []
-
-    model.eval()
-    with torch.no_grad():
-        for users, grd, mask in dataset.test_loader:
-            users_np = users.numpy().ravel()
-            users_dev = users.to(device)
-
-            scores, s_base, s_syn, s_cont = model.evaluate_with_components(
-                embs, users_dev)
-            scores_masked = scores - 1e8 * mask.to(device)
-
-            # Top-20 indices for contribution analysis
-            _, top20_idx = torch.topk(scores_masked, topk_eval)  # [bs, 20]
-
-            # --- Score contribution ---
-            for i in range(len(users_np)):
-                for b_idx in top20_idx[i].tolist():
-                    sb = abs(s_base[i, b_idx].item())
-                    ss = abs(s_syn[i,  b_idx].item())
-                    sc = abs(s_cont[i, b_idx].item())
-                    total = sb + ss + sc + 1e-8
-                    contrib_base.append(sb / total * 100)
-                    contrib_syn.append(ss  / total * 100)
-                    contrib_cont.append(sc / total * 100)
-
-            # --- Group-wise ---
-            # For each user, find their positive bundles in the test set
-            grd_np = grd.numpy()  # [bs, N_b]
-            for i, u in enumerate(users_np):
-                pos_bundles = grd_np[i].nonzero()[0].tolist()
-                if not pos_bundles:
-                    continue
-
-                # Get UI interactions for user u
-                ui_row      = u_i_graph[u]
-                ui_items    = set(ui_row.indices.tolist())
-
-                org_pos_bundles = []
-                ctx_pos_bundles = []
-                for b in pos_bundles:
-                    primary_core = int(core_items_np[b, 0])
-                    if primary_core in ui_items:
-                        org_pos_bundles.append(b)
-                    else:
-                        ctx_pos_bundles.append(b)
-
-                pred_u = scores_masked[i]  # [N_b]
-
-                def _eval_group(pos_list):
-                    if not pos_list:
-                        return None
-                    # Build a 1-row grd for this user restricted to group bundles
-                    grd_row  = torch.zeros(1, scores.shape[1])
-                    for pb in pos_list:
-                        grd_row[0, pb] = 1.0
-                    pred_row = pred_u.unsqueeze(0).cpu()
-                    _, cols  = torch.topk(pred_row, topk_eval)
-                    rows     = torch.zeros_like(cols)
-                    is_hit   = grd_row[rows.view(-1), cols.view(-1)].view(1, topk_eval)
-                    rec      = get_recall(pred_row, grd_row, is_hit, topk_eval)
-                    ndcg     = get_ndcg(pred_row, grd_row, is_hit, topk_eval)
-                    return rec, ndcg
-
-                res_org = _eval_group(org_pos_bundles)
-                res_ctx = _eval_group(ctx_pos_bundles)
-                if res_org:
-                    org_tmp["recall"][topk_eval] = _acc(org_tmp["recall"][topk_eval], res_org[0])
-                    org_tmp["ndcg"][topk_eval]   = _acc(org_tmp["ndcg"][topk_eval],   res_org[1])
-                    org_users_seen += 1
-                if res_ctx:
-                    ctx_tmp["recall"][topk_eval] = _acc(ctx_tmp["recall"][topk_eval], res_ctx[0])
-                    ctx_tmp["ndcg"][topk_eval]   = _acc(ctx_tmp["ndcg"][topk_eval],   res_ctx[1])
-                    ctx_users_seen += 1
-
-    # ------------------------------------------------------------------
-    # Print & log results
-    # ------------------------------------------------------------------
-    lines = ["\n===== Statistical Analysis ====="]
-
-    # 1. Group-wise
-    def safe_div(a, b):
-        return a / b if b > 0 else 0.0
-
-    org_rec  = safe_div(org_tmp["recall"][topk_eval][0], org_tmp["recall"][topk_eval][1])
-    org_ndcg = safe_div(org_tmp["ndcg"][topk_eval][0],   org_tmp["ndcg"][topk_eval][1])
-    ctx_rec  = safe_div(ctx_tmp["recall"][topk_eval][0], ctx_tmp["recall"][topk_eval][1])
-    ctx_ndcg = safe_div(ctx_tmp["ndcg"][topk_eval][0],   ctx_tmp["ndcg"][topk_eval][1])
-
-    lines.append("[Group-wise Performance @%d]" % topk_eval)
-    lines.append("  Organic   group: Recall=%.5f  NDCG=%.5f  (users w/ pos bundles: %d)"
-                 % (org_rec, org_ndcg, org_users_seen))
-    lines.append("  Contextual group: Recall=%.5f  NDCG=%.5f  (users w/ pos bundles: %d)"
-                 % (ctx_rec, ctx_ndcg, ctx_users_seen))
-
-    # 2. Score contribution
-    import numpy as np
-    if contrib_base:
-        m_base = float(np.mean(contrib_base))
-        m_syn  = float(np.mean(contrib_syn))
-        m_cont = float(np.mean(contrib_cont))
-        lines.append("[Score Contribution in Top-%d recommendations]" % topk_eval)
-        lines.append("  S_base  : %.2f %%" % m_base)
-        lines.append("  S_syn   : %.2f %%" % m_syn)
-        lines.append("  S_cont  : %.2f %%" % m_cont)
-
-    lines.append("=" * 32)
-    output = "\n".join(lines)
-    print(output)
-    with open(log_path, "a") as f:
-        f.write(output + "\n")
 
 
 # ---------------------------------------------------------------------------

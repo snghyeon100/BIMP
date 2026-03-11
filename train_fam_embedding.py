@@ -143,8 +143,8 @@ def main():
                 run.add_scalar("loss",     loss.detach(),     batch_anchor)
 
                 pbar.set_description(
-                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f"
-                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item()))
+                    "epoch: %d, loss: %.4f, bpr: %.4f, c: %.4f, beta: %.4f"
+                    % (epoch, loss.item(), bpr_loss.item(), c_loss.item(), torch.sigmoid(model.beta).item()))
 
 
                 if (batch_anchor + 1) % test_interval_bs == 0:
@@ -159,6 +159,7 @@ def main():
 
         print("\n" + "=" * 60)
         print("Training finished.")
+        print("Final learned (sigmoid) beta value: {:.4f}".format(torch.sigmoid(model.beta).item()))
         print("=" * 60 + "\n")
 
         run.close()
