@@ -502,9 +502,24 @@ class DSS(nn.Module):
 
     def _i2b_reduce(self, nodes):
         Z = nodes.mailbox['z']  # [B, deg, d]
-        V_b = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z, mask=None)
-        H_prev = nodes.data['h'].unsqueeze(1)  # [B, 1, d]
-        H_new = self.mab_i2b_main(H_prev, V_b, mask_y=None)  # [B, 1, d]
+        B = Z.shape[0]
+        chunk_size = 64
+        
+        if B > chunk_size:
+            H_new_list = []
+            H_prev_all = nodes.data['h'].unsqueeze(1)
+            for i in range(0, B, chunk_size):
+                Z_c = Z[i : i + chunk_size]
+                H_p = H_prev_all[i : i + chunk_size]
+                V_b_c = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z_c, mask=None)
+                H_new_c = self.mab_i2b_main(H_p, V_b_c, mask_y=None)
+                H_new_list.append(H_new_c)
+            H_new = torch.cat(H_new_list, dim=0)
+        else:
+            V_b = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z, mask=None)
+            H_prev = nodes.data['h'].unsqueeze(1)  # [B, 1, d]
+            H_new = self.mab_i2b_main(H_prev, V_b, mask_y=None)  # [B, 1, d]
+            
         return {'h_new': H_new.squeeze(1)}
 
     def _b2i_msg(self, edges):
@@ -513,9 +528,24 @@ class DSS(nn.Module):
 
     def _b2i_reduce(self, nodes):
         E_comb = nodes.mailbox['g']  # [B, deg, d]
-        G = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_comb, mask=None)
-        X_prev = nodes.data['h'].unsqueeze(1)
-        X_new = self.mab_b2i_main(X_prev, G, mask_y=None)
+        B = E_comb.shape[0]
+        chunk_size = 64
+        
+        if B > chunk_size:
+            X_new_list = []
+            X_prev_all = nodes.data['h'].unsqueeze(1)
+            for i in range(0, B, chunk_size):
+                E_c = E_comb[i : i + chunk_size]
+                X_p = X_prev_all[i : i + chunk_size]
+                G_c = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_c, mask=None)
+                X_new_c = self.mab_b2i_main(X_p, G_c, mask_y=None)
+                X_new_list.append(X_new_c)
+            X_new = torch.cat(X_new_list, dim=0)
+        else:
+            G = self._within_att(self.mab_b2i_within, self.mab_b2i_outer, E_comb, mask=None)
+            X_prev = nodes.data['h'].unsqueeze(1)
+            X_new = self.mab_b2i_main(X_prev, G, mask_y=None)
+            
         return {'h_new': X_new.squeeze(1)}
 
     # ------------------------------------------------------------------
@@ -555,7 +585,17 @@ class DSS(nn.Module):
         if use_bimp_vb:
             Z_loc = X_i_g[items_loc_cs]
             Z_loc = Z_loc.masked_fill(~valid_loc.unsqueeze(-1), 0.0)
-            V_b_raw = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, Z_loc, mask=valid_loc)
+            
+            U = Z_loc.shape[0]
+            chunk_size = 64
+            V_b_raw_list = []
+            for i in range(0, U, chunk_size):
+                end_idx = min(i + chunk_size, U)
+                z_chunk = Z_loc[i:end_idx]
+                mask_chunk = valid_loc[i:end_idx]
+                vb_chunk = self._within_att(self.mab_i2b_within, self.mab_i2b_outer, z_chunk, mask=mask_chunk)
+                V_b_raw_list.append(vb_chunk)
+            V_b_raw = torch.cat(V_b_raw_list, dim=0)
         else:
             V_b_raw = X_i_init_full[items_loc_cs]
 
